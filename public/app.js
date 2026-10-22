@@ -1991,45 +1991,6 @@ App.getBatches = async function () {
   };
 
 // ==========================
-// 🔧 One-time Subject Upgrade Helper
-// ==========================
-App.upgradeSubjectsIfNeeded = async function () {
-  let subjects = await App.getSubjects();
-  const batches = await App.getBatches();
-
-  let changed = false;
-
-  subjects = subjects.map(sub => {
-    // If already upgraded, leave it
-    if (sub.program && sub.semester && sub.year) {
-      return sub;
-    }
-
-    const batch = batches.find(b => String(b.id) === String(sub.batchId));
-
-    if (!batch) {
-      console.warn("Orphan subject detected:", sub);
-      return null;
-    }
-
-    changed = true;
-
-    return {
-      ...sub,
-      program: batch.program,
-      semester: batch.semester,
-      year: batch.year
-    };
-  });
-
-  subjects = subjects.filter(Boolean); // ✅ ADD THIS
-
-  if (changed) {
-    console.log("✅ Subjects upgraded to new format.");
-  }
-};
-
-// ==========================
 // Day Status System (Flexible Closures)
 // ==========================
 
@@ -2055,13 +2016,9 @@ App.getDayStatus = async function (date) {
 };
 
 
+// Returns true if saved
 App.setDayStatus = async function (date, obj) {
-
-  // Save to Firestore
-  await App.saveDayStatusToFirestore(date, obj);
-
-  // ❌ DISABLED local backup (Phase 1 migration)
-  // map[date] = obj;
+  return await App.saveDayStatusToFirestore(date, obj);
 };
 
 
@@ -2073,9 +2030,7 @@ App.clearDayStatus = async function (date) {
 
 
 App.isClosedDay = async function (date) {
-  const d = new Date(date);
-
-  if (d.getDay() === 0) return {
+  if (App.isSundayDate(date)) return {
     type: "sunday",
     reason: "Sunday"
   };
@@ -2209,9 +2164,15 @@ async function renderClosedDays() {
     delBtn.textContent = "Remove";
     delBtn.style.marginLeft = "10px";
 
-    delBtn.onclick = () => {
-      App.clearDayStatus(date);
-      renderClosedDays();
+    delBtn.onclick = async () => {
+      delBtn.disabled = true;
+      try {
+        await App.clearDayStatus(date);
+      } catch (e) {
+        console.error(e);
+        await UI.alert("Could not remove the closed day. Check your internet connection and try again.");
+      }
+      await renderClosedDays();
     };
 
     li.appendChild(delBtn);
@@ -2220,7 +2181,7 @@ async function renderClosedDays() {
 }
 
 if (addClosedDayBtn) {
-  addClosedDayBtn.onclick = () => {
+  addClosedDayBtn.onclick = async () => {
     const date = closedDayDate.value;
     const type = closedDayType.value;
     const reason = closedDayReason.value.trim();
@@ -2230,18 +2191,24 @@ if (addClosedDayBtn) {
       return;
     }
 
-    App.setDayStatus(date, {
+    addClosedDayBtn.disabled = true;
+    const saved = await App.setDayStatus(date, {
       date,
       type,
       reason,
       markedBy: "HOD",
       timestamp: new Date().toISOString()
     });
+    addClosedDayBtn.disabled = false;
 
+    if (!saved) {
+      UI.alert("Could not mark the day closed. Check your internet connection and try again.");
+      return;
+    }
     closedDayDate.value = "";
     closedDayReason.value = "";
 
-    renderClosedDays();
+    await renderClosedDays();
   };
 }
 
@@ -3579,7 +3546,6 @@ if (uploadedSubject) {
 // ==========================
 // Run data migrations first
 async function initApp() {
-await App.upgradeSubjectsIfNeeded();
 await renderBatches();
 await loadBatchesIntoSubjectSelect();
 await renderSubjects();
@@ -5979,8 +5945,9 @@ function exportToExcel() {
     classesConductedToday++;
 
     Object.values(attendance).forEach(status => {
-      if (status === "Present") totalPresentToday++;
-      if (status === "Absent") totalAbsentToday++;
+      const s = App.normalizeStatus(status);
+      if (s === "Present") totalPresentToday++;
+      if (s === "Absent") totalAbsentToday++;
     });
     totalAbsentToday -= (await App._getDocsByIdPrefix("leaves", `${sub.id}_${today}_`)).length;   // leave is not absence
   }
