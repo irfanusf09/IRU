@@ -92,24 +92,41 @@
   <div id="sidebar">
     <h2>Menu</h2>
 
-    <button onclick="showSection('hodDashboardSection')">🏠 HOD Dashboard</button>
-    <button onclick="showSection('studentDashboardSection')">Dashboard</button>
-    <button onclick="showSection('attendanceSection')">Attendance</button>
-    <button onclick="showSection('reportsSection')">Reports</button>
-    <button onclick="showSection('defaultersSection')">Defaulters List</button>
-    <button onclick="showSection('adminSection')">Admin Panel</button>
-    <button onclick="showSection('cancelledClassesSection')">Cancelled Classes Log</button>
-    <button onclick="showSection('myRequestsSection')">My Requests</button>
-    <button onclick="showSection('correctionRequestsSection')">Correction Requests</button>
-    <button onclick="showSection('hodCorrectionsSection')">Attendance Correction Register</button>
-    <button onclick="showSection('archiveSection')">🏛️ Archive Room</button>
-    <button onclick="showSection('exitRegistrySection')">🎓 Alumni Registry</button>
+    <!-- Groups whose buttons are all hidden for a role hide their heading too (applyRoleGuards) -->
+    <div class="menu-group">
+      <div class="menu-heading">Daily</div>
+      <button onclick="showSection('hodDashboardSection')">🏠 HOD Dashboard</button>
+      <button onclick="showSection('studentDashboardSection')">🏠 Dashboard</button>
+      <button onclick="showSection('attendanceSection')">✅ Attendance</button>
+    </div>
 
+    <div class="menu-group">
+      <div class="menu-heading">Reports</div>
+      <button onclick="showSection('reportsSection')">📊 Reports</button>
+      <button onclick="showSection('defaultersSection')">⚠️ Defaulters List</button>
+    </div>
 
-    <button id="changePasswordBtn">🔑 Change Password</button>
-    <button id="recoveryBtn">📧 Recovery Email</button>
-    <button class="installAppBtn" style="display:none;">📲 Install App</button>
-    <button id="logoutBtn">Logout</button>
+    <div class="menu-group">
+      <div class="menu-heading">Records</div>
+      <button onclick="showSection('correctionsSection')">📝 Corrections</button>
+      <button onclick="showSection('myRequestsSection')">📝 My Requests</button>
+      <button onclick="showSection('recordsSection')">🗂️ Leaves &amp; Cancelled Classes</button>
+    </div>
+
+    <div class="menu-group">
+      <div class="menu-heading">Admin</div>
+      <button onclick="showSection('adminSection')">⚙️ Admin Panel</button>
+      <button onclick="showSection('archiveSection')">🏛️ Archive Room</button>
+      <button onclick="showSection('exitRegistrySection')">🎓 Alumni Registry</button>
+    </div>
+
+    <div class="menu-group">
+      <div class="menu-heading">Account</div>
+      <button id="changePasswordBtn">🔑 Change Password</button>
+      <button id="recoveryBtn">📧 Recovery Email</button>
+      <button class="installAppBtn" style="display:none;">📲 Install App</button>
+      <button id="logoutBtn">🚪 Logout</button>
+    </div>
   </div>
 
   <!-- ================= MAIN CONTENT ================= -->
@@ -463,26 +480,27 @@
   </div>
 
 </div>
-<!-- ================= CANCELLED CLASSES LOG (HOD) ================= -->
-<div id="cancelledClassesSection" class="section">
-  <h1>Cancelled Classes Log (View Only)</h1>
-  <div id="cancelledClassesLog"></div>
-</div>
-
-<!-- ================= CORRECTION REQUESTS (HOD) ================= -->
-<div id="correctionRequestsSection" class="section">
-  <h2>Correction Requests (HOD)</h2>
+<!-- ================= CORRECTIONS (HOD): pending requests + decided history ================= -->
+<div id="correctionsSection" class="section">
+  <h1>Corrections</h1>
+  <h2>Waiting for your decision</h2>
   <div id="correctionRequestsOutput"></div>
+
+  <h2 style="margin-top:28px;">Correction register</h2>
+  <p style="font-size:13px; color:#6b7280;">Every decided correction, approved or rejected. Approved ones are marked * in registers.</p>
+  <div id="hodCorrectionsOutput" style="overflow-x:auto;"></div>
 </div>
 
-<!-- ================= ATTENDANCE CORRECTION REGISTER (HOD) ================= -->
-<div id="hodCorrectionsSection" class="section">
-  <h2>Attendance Correction Register</h2>
-  <div id="hodCorrectionsOutput"></div>
-
-  <h2 style="margin-top:28px;">Leave Register</h2>
+<!-- ================= RECORDS (HOD): leaves + classes not held ================= -->
+<div id="recordsSection" class="section">
+  <h1>Leaves &amp; Cancelled Classes</h1>
+  <h2>Leave register</h2>
   <p style="font-size:13px; color:#6b7280;">Every leave recorded by teachers. Removing one makes that day count as Absent again.</p>
   <div id="leaveRegisterOutput" style="overflow-x:auto;"></div>
+
+  <h2 style="margin-top:28px;">Classes not held</h2>
+  <p style="font-size:13px; color:#6b7280;">Classes a teacher marked as not held, with the reason (view only).</p>
+  <div id="cancelledClassesLog" style="overflow-x:auto;"></div>
 </div>
 
 <div id="archiveSection" class="section">

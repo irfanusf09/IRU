@@ -1591,7 +1591,7 @@ App.HodDash.renderCorrections = async function () {
   }
   box.innerHTML = `<p style="margin:0 0 8px;"><b style="color:#b45309;">${pending.length}</b> request(s) waiting for your decision.</p>
     <button id="hodDashReviewBtn" class="primary">Review now</button>`;
-  document.getElementById("hodDashReviewBtn").onclick = () => showSection("correctionRequestsSection");
+  document.getElementById("hodDashReviewBtn").onclick = () => showSection("correctionsSection");
 };
 
 App.HodDash.renderToday = async function (today) {
@@ -4664,9 +4664,8 @@ App.SECTION_RULES = {
     "reportsSection",
     "defaultersSection",
     "adminSection",
-    "correctionRequestsSection",
-    "cancelledClassesSection",
-    "hodCorrectionsSection",
+    "correctionsSection",
+    "recordsSection",
     "archiveSection",
     "exitRegistrySection"
   ],
@@ -4707,6 +4706,10 @@ const rules = App.SECTION_RULES;
   } else {
   btn.style.display = "";
   }
+  });
+  document.querySelectorAll("#sidebar .menu-group").forEach(group => {
+    const anyShown = [...group.querySelectorAll("button")].some(b => b.style.display !== "none" && !b.classList.contains("installAppBtn"));
+    group.style.display = anyShown ? "" : "none";
   });
   
 
@@ -4962,7 +4965,6 @@ function updateAuthUI() {
     loginScreen.style.display = "none";
     appContainer.style.display = "flex";
     
-    updateSidebarForRole(user.role); 
   } else {
     loginScreen.style.display = "block";
     appContainer.style.display = "none";
@@ -5229,11 +5231,7 @@ if (id !== "archiveSection") {
   }
 
   // Initialise Cancelled Classes Log ONLY when that page opens
-  if (id === "cancelledClassesSection") {
-    if (App.CancelledClasses && App.CancelledClasses.init) {
-      App.CancelledClasses.init();
-    }
-  }
+
 
 // Show target
 
@@ -5258,11 +5256,11 @@ if (id !== "archiveSection") {
   }
   if (id === "hodDashboardSection") App.HodDash.init();
 
-  if (id === "correctionRequestsSection") App.CorrectionsPanel.init();
+  if (id === "correctionsSection") { App.CorrectionsPanel.init(); App.HODCorrections.init(); }
   if (id === "myRequestsSection") App.MyRequests.init();
   
   // ⚡ KEY FIXES: Match the names used in your specific app.js
-  if (id === "hodCorrectionsSection") { App.HODCorrections.init(); App.LeaveRegister.render(); }
+  if (id === "recordsSection") { App.LeaveRegister.render(); App.CancelledClasses.init(); }
   if (id === "archiveSection") {
     // 🔒 LOCK THE GATE: Reset the search flag
     archiveSearchTriggered = false; 
@@ -5888,34 +5886,6 @@ function exportToExcel() {
     `;
   }
 };
-// ==========================================
-// UNIFIED VISIBILITY GUARD (HOD + TEACHER)
-// ==========================================
-function updateSidebarForRole(role) {
-  const archiveBtn = document.querySelector("button[onclick*='archiveSection']");
-  const correctionRegBtn = document.querySelector("button[onclick*='hodCorrectionsSection']");
-  const adminBtn = document.getElementById("adminBtn") || document.querySelector("button[onclick*='adminSection']");
-  const myRequestsBtn = document.querySelector("button[onclick*='myRequestsSection']");
-  const alumniBtn = document.querySelector("button[onclick*='exitRegistrySection']"); // ✅ 1. ADD THIS
-
-  if (role === 'HOD') {
-    // 🛡️ HOD visibility: Everything is open
-    if (archiveBtn) archiveBtn.style.display = 'block';
-    if (correctionRegBtn) correctionRegBtn.style.display = 'block';
-    if (adminBtn) adminBtn.style.display = 'block';
-    if (myRequestsBtn) myRequestsBtn.style.display = 'block'; 
-    if (alumniBtn) alumniBtn.style.display = 'block'; // ✅ 2. ADD THIS
-  } 
-  else if (role === 'Teacher') {
-    // 🛡️ Teacher visibility: Standard tools only
-    if (archiveBtn) archiveBtn.style.display = 'none';
-    if (correctionRegBtn) correctionRegBtn.style.display = 'none';
-    if (adminBtn) adminBtn.style.display = 'none';
-    if (myRequestsBtn) myRequestsBtn.style.display = 'block';
-    if (alumniBtn) alumniBtn.style.display = 'none'; // ✅ 3. ADD THIS (Teachers shouldn't see it)
-  }
-} // 🟢 Ensure this is the absolute end of your file. No extra brackets!
-
 // ==========================================
 // OFFICIAL ALUMNI PDF GENERATOR
 // ==========================================
