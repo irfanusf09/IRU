@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security Self-Check</title>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #f1f5f9; color: #111827; margin: 0; padding: 16px; }
+    .card { max-width: 760px; margin: 0 auto; background: #fff; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px; }
+    h1 { font-size: 20px; margin-top: 0; }
+    h2 { font-size: 15px; margin: 18px 0 6px; }
+    p, li { font-size: 14px; line-height: 1.5; }
+    input { padding: 7px 9px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; width: 100%; box-sizing: border-box; margin-bottom: 6px; }
+    .row { display: flex; gap: 16px; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 220px; }
+    button { padding: 9px 16px; border-radius: 6px; border: 1px solid #1f4fd8; background: #1f4fd8; color: #fff; cursor: pointer; font-size: 14px; }
+    button:disabled { opacity: .6; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+    td, th { border-bottom: 1px solid #e2e8f0; padding: 6px; text-align: left; vertical-align: top; }
+    .ok { color: #15803d; font-weight: 600; }
+    .bad { color: #b91c1c; font-weight: 600; }
+    .skip { color: #6b7280; }
+    #verdict { padding: 12px; border-radius: 6px; margin-top: 14px; font-weight: 600; display: none; }
+  </style>
+</head>
+<body>
+<div class="card">
+  <h1>🔒 Security Self-Check</h1>
+  <p>
+    This page checks that the database protection is really working on Google's servers.
+    It logs in as a <b>student</b> and as a <b>teacher</b> and tries things they must <b>not</b> be allowed to do
+    (read other people's data, change attendance, make themselves HOD, …). Every one of them should be <span class="ok">✅ blocked</span>.
+  </p>
+  <p>Use test accounts. The page logs itself out when it finishes, and it never changes real data. If something is wrongly
+    allowed, it immediately undoes it and shows it in <span class="bad">red</span>.</p>
+
+  <div class="row">
+    <div>
+      <h2>A student login</h2>
+      <input id="stuId" placeholder="Student login ID (e.g. ug2025-02) or recovery email" autocapitalize="none">
+      <input id="stuPw" type="password" placeholder="Student password">
+    </div>
+    <div>
+      <h2>A teacher login</h2>
+      <input id="teaId" placeholder="Teacher login ID or recovery email" autocapitalize="none">
+      <input id="teaPw" type="password" placeholder="Teacher password">
+    </div>
+  </div>
+  <button id="runBtn">Run security check</button>
+  <div id="verdict"></div>
+  <div id="results"></div>
+</div>
+
+<script src="firebase-config.js"></script>
+<script>
+  firebase.initializeApp(firebaseConfig);
+  const db = firebase.firestore();
+  const auth = firebase.auth();
+  const PROBE = "zz-security-check";
+  let rows = [], problems = 0;
+
+  function addSection(title) { rows.push({ section: title }); render(); }
+  function addRow(name, expected, outcome, note) {
+    const pass = outcome === expected;
+    if (!pass && outcome !== "skipped") problems++;
+    rows.push({ name, expected, outcome, pass, note });
+    render();
+  }
+  function render() {
+    let html = "<table><tr><th>Check</th><th>Should be</th><th>Result</th></tr>";
+    rows.forEach(r => {
+      if (r.section) { html += `<tr><td colspan="3"><h2>${r.section}</h2></td></tr>`; return; }
+      const cls = r.outcome === "skipped" ? "skip" : (r.pass ? "ok" : "bad");
+      const label = r.outcome === "skipped" ? "— not tested" : (r.pass ? "✅ " : "❌ ") + r.outcome;
+      html += `<tr><td>${r.name}${r.note ? `<br><small class="skip">${r.note}</small>` : ""}</td>
+               <td>${r.expected}</td><td class="${cls}">${label}</td></tr>`;
+    });
+    document.getElementById("results").innerHTML = html + "</table>";
+  }
+
+  // Try an action; report "blocked" / "allowed" / "error: …"
+  async function attempt(fn) {
+    try { await fn(); return "allowed"; }
+    catch (e) { return e && e.code === "permission-denied" ? "blocked" : "error: " + ((e && (e.code || e.message)) || e); }
+  }
+  async function expectBlocked(name, fn, undo) {
+    const out = await attempt(fn);
+    let note = "";
+    if (out === "allowed" && undo) {
+      try { await undo(); note = "It was allowed — undone automatically."; }
+      catch (e) { note = "It was allowed and could NOT be undone automatically — tell the developer."; }
+    }
+    addRow(name, "blocked", out, note);
+  }
+  async function expectAllowed(name, fn) { addRow(name, "allowed", await attempt(fn)); }
+
+  async function signInAs(loginId, password, role) {
+    const id = String(loginId || "").trim().toLowerCase();
+    let email;
+    if (id.includes("@")) {
+      email = id;                      // someone who confirmed a recovery email logs in with it
+    } else {
+      const snap = await db.collection("loginNames").doc(id).get();
+      if (!snap.exists) throw new Error(`Login ID "${id}" not found`);
+      email = snap.data().email;
+    }
+    try {
+      await auth.signInWithEmailAndPassword(email, password);
+    } catch (e) {
+      throw new Error("Could not log in with that ID/email and password (" + (e.code || e.message) + ")");
+    }
+    const prof = await db.collection("users").doc(auth.currentUser.uid).get();
+    if (!prof.exists) throw new Error("This login has no profile");
+    const p = prof.data();
+    if (p.role !== role) throw new Error(`This is a ${p.role} account, not a ${role} account`);
+    if (p.active !== true) throw new Error("This account is deactivated");
+    return { uid: auth.currentUser.uid, profile: p };
+  }
+
+  async function run() {
+    const btn = document.getElementById("runBtn");
+    btn.disabled = true; btn.textContent = "Checking…";
+    rows = []; problems = 0;
+    const verdict = document.getElementById("verdict");
+    verdict.style.display = "none";
+
+    try {
+      // ---------- Not logged in ----------
+      await auth.signOut();
+      addSection("1. Someone who is not logged in");
+      await expectBlocked("Read the student list", () => db.collection("students").get());
+      await expectBlocked("Read attendance", () => db.collection("attendance").get());
+      await expectBlocked("Read teachers", () => db.collection("teachers").get());
+      await expectBlocked("Read accounts", () => db.collection("users").get());
+      await expectBlocked("List all login IDs", () => db.collection("loginNames").get());
+      await expectBlocked("Create a subject", () => db.collection("subjects").doc(PROBE).set({ name: PROBE }),
+                          () => db.collection("subjects").doc(PROBE).delete());
+
+      // ---------- Student ----------
+      const sId = document.getElementById("stuId").value, sPw = document.getElementById("stuPw").value;
+      addSection("2. A logged-in student");
+      if (!sId || !sPw) {
+        addRow("Student checks", "blocked", "skipped", "Enter a student login to run these.");
+      } else {
+        try {
+          const me = await signInAs(sId, sPw, "Student");
+          await expectAllowed("Read own student record", () => db.collection("students").doc(String(me.profile.studentDocId)).get());
+          await expectBlocked("Read the whole student list", () => db.collection("students").get());
+          await expectBlocked("Read teachers", () => db.collection("teachers").get());
+          await expectBlocked("Read accounts", () => db.collection("users").get());
+          await expectBlocked("Read correction requests", () => db.collection("correctionRequests").get());
+          await expectBlocked("Make themselves HOD", () => db.collection("users").doc(me.uid).update({ role: "HOD" }),
+                              () => db.collection("users").doc(me.uid).update({ role: "Student" }));
+          await expectBlocked("Mark attendance", () => db.collection("attendance").doc(PROBE + "_2000-01-01")
+                              .set({ subjectId: PROBE, date: "2000-01-01", records: {} }));
+          await expectBlocked("Change enrollments", () => db.collection("enrollments").doc(PROBE).set({ students: [] }),
+                              () => db.collection("enrollments").doc(PROBE).delete());
+          await expectBlocked("Approve a correction", () => db.collection("attendanceCorrections").doc(PROBE).set({ decision: "Approved" }));
+        } catch (e) {
+          addRow("Log in as the student", "allowed", "error: " + e.message);
+        }
+        await auth.signOut();
+      }
+
+      // ---------- Teacher ----------
+      const tId = document.getElementById("teaId").value, tPw = document.getElementById("teaPw").value;
+      addSection("3. A logged-in teacher");
+      if (!tId || !tPw) {
+        addRow("Teacher checks", "blocked", "skipped", "Enter a teacher login to run these.");
+      } else {
+        try {
+          const me = await signInAs(tId, tPw, "Teacher");
+          await expectAllowed("Read the student list (needed to mark attendance)", () => db.collection("students").get());
+          await expectBlocked("Read accounts", () => db.collection("users").get());
+          await expectBlocked("Make themselves HOD", () => db.collection("users").doc(me.uid).update({ role: "HOD" }),
+                              () => db.collection("users").doc(me.uid).update({ role: "Teacher" }));
+          await expectBlocked("Mark attendance for a subject not assigned to them",
+                              () => db.collection("attendance").doc(PROBE + "_2000-01-01")
+                                      .set({ subjectId: PROBE, date: "2000-01-01", records: {} }));
+          const existing = await db.collection("attendance").limit(1).get();
+          if (existing.empty) {
+            addRow("Change attendance after it was saved", "blocked", "skipped", "No attendance saved yet — mark one class first to test this.");
+          } else {
+            const doc = existing.docs[0];
+            await expectBlocked("Change attendance after it was saved", () => doc.ref.set(doc.data()));
+            await expectBlocked("Delete saved attendance", () => doc.ref.delete());
+          }
+          await expectBlocked("Create a subject", () => db.collection("subjects").doc(PROBE).set({ name: PROBE }),
+                              () => db.collection("subjects").doc(PROBE).delete());
+          await expectBlocked("Create a student", () => db.collection("students").doc(PROBE).set({ name: PROBE }),
+                              () => db.collection("students").doc(PROBE).delete());
+          await expectBlocked("Approve a correction directly", () => db.collection("attendanceCorrections").doc(PROBE).set({ decision: "Approved" }));
+          await expectBlocked("Change someone's login", () => db.collection("loginNames").doc(PROBE).set({ email: "x", uid: "x" }),
+                              () => db.collection("loginNames").doc(PROBE).delete());
+        } catch (e) {
+          addRow("Log in as the teacher", "allowed", "error: " + e.message);
+        }
+        await auth.signOut();
+      }
+    } finally {
+      await auth.signOut().catch(() => {});
+      btn.disabled = false; btn.textContent = "Run security check";
+    }
+
+    verdict.style.display = "block";
+    if (problems === 0) {
+      verdict.style.background = "#dcfce7"; verdict.style.color = "#166534";
+      verdict.textContent = "✅ All tested protections are working.";
+    } else {
+      verdict.style.background = "#fee2e2"; verdict.style.color = "#991b1b";
+      verdict.textContent = `❌ ${problems} problem(s) found. Take a screenshot and send it to the developer before using the app officially.`;
+    }
+  }
+
+  document.getElementById("runBtn").onclick = run;
+</script>
+</body>
+</html>

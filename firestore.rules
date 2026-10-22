@@ -1,0 +1,190 @@
+rules_version = '2';
+
+// =====================================================================
+// Department Attendance System — Firestore Security Rules
+//
+// Who can do what (enforced by Google's servers, not by the app):
+//   HOD      : reads everything; manages batches, subjects, students,
+//              teachers, accounts, closures; approves corrections.
+//              Cannot create or change attendance records.
+//   Teacher  : reads class data; marks attendance ONCE per class per day,
+//              only for subjects assigned to them; requests corrections;
+//              marks own classes as not held.
+//   Student  : reads only their own student record, plus class-level data
+//              (attendance, subjects) needed for their dashboard.
+//   Anyone not logged in: can only look up a login ID (to sign in).
+//
+// Saved attendance can never be edited or deleted through the app.
+// Changes go through correction requests approved by the HOD.
+// =====================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helpers ----------
+    function signedIn() { return request.auth != null; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(profilePath()); }
+    function me() { return get(profilePath()).data; }
+    function isActive() { return hasProfile() && me().active == true; }
+    function isHod() { return isActive() && me().role == "HOD"; }
+    function isTeacher() { return isActive() && me().role == "Teacher"; }
+    function isStudent() { return isActive() && me().role == "Student"; }
+    function isStaff() { return isHod() || isTeacher(); }
+    function anyUser() { return isActive(); }
+
+    function assignmentPath(subjectId) {
+      return /databases/$(database)/documents/subjectAssignments/$(subjectId);
+    }
+    // Is the logged-in teacher assigned to this subject?
+    function teaches(subjectId) {
+      return isTeacher()
+        && subjectId is string
+        && exists(assignmentPath(subjectId))
+        && get(assignmentPath(subjectId)).data.teacherId == me().teacherId;
+    }
+    function hodSetupDone() { return exists(/databases/$(database)/documents/config/hod); }
+
+    // ---------- One-time HOD setup ----------
+    // The very first account to complete setup becomes HOD. Afterwards
+    // config/hod exists and this can never happen again.
+    match /config/hod {
+      allow get: if true;
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly(["uid", "createdAt"])
+        && request.resource.data.uid == request.auth.uid
+        && getAfter(profilePath()).data.role == "HOD";
+      allow update, delete: if false;
+    }
+
+    // ---------- Accounts ----------
+    match /users/{uid} {
+      allow get: if signedIn() && (request.auth.uid == uid || isHod());
+      allow list: if isHod();
+      allow create: if isHod()
+        || (signedIn()
+            && request.auth.uid == uid
+            && request.resource.data.role == "HOD"
+            && !hodSetupDone()
+            && getAfter(/databases/$(database)/documents/config/hod).data.uid == uid);
+      // HOD manages accounts; a user may only clear their own
+      // "must change password" flag and record their own recovery email.
+      allow update: if isHod()
+        || (signedIn()
+            && request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["mustChangePassword", "recoveryEmail"])
+            && request.resource.data.mustChangePassword == false
+            && request.resource.data.get("recoveryEmail", "") is string);
+      allow delete: if isHod();
+    }
+
+    // Login ID -> internal sign-in address. Needed before signing in,
+    // so single lookups are public; listing all IDs is not allowed.
+    match /loginNames/{loginId} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if isHod()
+        || (signedIn()
+            && !hodSetupDone()
+            && getAfter(/databases/$(database)/documents/config/hod).data.uid == request.auth.uid
+            && request.resource.data.uid == request.auth.uid);
+      allow update, delete: if isHod();
+    }
+
+    // ---------- Department setup (HOD writes, logged-in users read) ----------
+    match /batches/{id} {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+    match /subjects/{id} {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+    match /enrollments/{id} {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+    match /subjectAssignments/{id} {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+    match /dayStatuses/{id} {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+
+    // ---------- People ----------
+    match /teachers/{id} {
+      allow read: if isStaff();
+      allow write: if isHod();
+    }
+    match /students/{id} {
+      allow read: if isStaff() || (isStudent() && me().studentDocId == id);
+      allow write: if isHod();
+    }
+
+    // ---------- Attendance (create once, never edit) ----------
+    match /attendance/{docId} {
+      allow read: if anyUser();
+      allow create: if teaches(request.resource.data.subjectId)
+        && request.resource.data.date is string
+        && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && docId == request.resource.data.subjectId + "_" + request.resource.data.date
+        && request.resource.data.records is map;
+      allow update, delete: if false;
+    }
+
+    match /classCancellations/{docId} {
+      allow read: if anyUser();
+      allow create: if (teaches(request.resource.data.subjectId) || isHod())
+        && request.resource.data.subjectId is string
+        && request.resource.data.date is string
+        && docId == request.resource.data.subjectId + "_" + request.resource.data.date;
+      allow update: if false;
+      allow delete: if isHod();
+    }
+
+    // ---------- Corrections ----------
+    match /correctionRequests/{id} {
+      allow read: if isStaff();
+      allow create: if teaches(request.resource.data.subjectId)
+        && request.resource.data.requestedBy == me().teacherId
+        && request.resource.data.status == "pending";
+      allow update: if isHod();
+      allow delete: if false;
+    }
+    match /attendanceCorrections/{id} {
+      allow read: if anyUser();
+      allow create: if isHod();
+      allow update, delete: if false;
+    }
+
+    // ---------- Leave ----------
+    // A teacher records leave for a student who has an entry in that day's saved
+    // attendance of a subject they teach. Leaves are never edited; only the HOD removes one.
+    match /leaves/{docId} {
+      allow read: if anyUser();
+      allow create: if teaches(request.resource.data.subjectId)
+        && request.resource.data.keys().hasOnly(["subjectId", "date", "studentId", "type", "reference", "markedBy", "markedAt"])
+        && request.resource.data.type in ["CASUAL", "MEDICAL", "NCC", "OTHER"]
+        && request.resource.data.date is string
+        && request.resource.data.studentId is string
+        && request.resource.data.reference is string
+        && request.resource.data.reference.size() <= 100
+        && request.resource.data.markedBy == me().teacherId
+        && docId == request.resource.data.subjectId + "_" + request.resource.data.date + "_" + request.resource.data.studentId
+        && exists(/databases/$(database)/documents/attendance/$(request.resource.data.subjectId + "_" + request.resource.data.date))
+        && request.resource.data.studentId in get(/databases/$(database)/documents/attendance/$(request.resource.data.subjectId + "_" + request.resource.data.date)).data.records;
+      allow update: if false;
+      allow delete: if isHod();
+    }
+
+    // ---------- Settings (e.g. casual leave limit) ----------
+    match /config/settings {
+      allow read: if anyUser();
+      allow write: if isHod();
+    }
+
+    // Everything else is denied by default.
+  }
+}
