@@ -161,16 +161,17 @@
 
       <select id="subjectSelect"></select>
 
+      <div id="attendanceTopBar"></div>
+
       <ul id="student-list"></ul>
 
-      <button id="saveBtn">Save Attendance</button>
-<span
-  id="viewOnlyBtn"
-  style="display:none; font-weight:bold; color:#555; padding:6px 0; display:inline-block;"
->
-  View Only (HOD)
-</span>
-<p id="saveStatus"></p>
+      <!-- Stays at the bottom of the screen while scrolling a long class list -->
+      <div id="attendanceSaveBar" style="display:none;">
+        <span id="attendanceCountBox"></span>
+        <span id="saveStatus"></span>
+        <span id="viewOnlyBtn" style="display:none;">View Only (HOD)</span>
+        <button id="saveBtn" class="primary">Save Attendance</button>
+      </div>
     </div>
 
     <!-- ================= Reports ================= -->

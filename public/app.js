@@ -3738,78 +3738,55 @@ html += "</tbody></table>";
   const subjectSelect = document.getElementById("subjectSelect");
   const studentList = document.getElementById("student-list");
   const dateInput = document.getElementById("attendanceDate");
-  dateInput.value = "";   // 🔥 RESET SHARED STATE
   const saveBtn = document.getElementById("saveBtn");
   const saveStatus = document.getElementById("saveStatus");
+  const saveBar = document.getElementById("attendanceSaveBar");
+  const countBox = document.getElementById("attendanceCountBox");
+  const topBar = document.getElementById("attendanceTopBar");
+  const viewOnlyBtn = document.getElementById("viewOnlyBtn");
+  if (!subjectSelect || !studentList || !dateInput || !saveBtn || !saveBar || !countBox || !topBar) return;
 
+  const user = Auth.currentUser();
+  const isTeacher = !!user && user.role === "Teacher";
+  let uiLoaded = false;   // Save works only after a class list was shown
+  let loadSeq = 0;        // only the latest load may draw (subject/date can change quickly)
 
-  if (!subjectSelect || !studentList || !dateInput || !saveBtn) return;
-
-  let uiLoaded = false; // 🔒 critical guard
-  // 🧼 Reset UI when Attendance screen opens
+  // Reset the screen each time it opens
+  dateInput.value = "";
   studentList.innerHTML = "";
+  topBar.innerHTML = "";
   saveStatus.textContent = "";
-  const box = document.getElementById("attendanceCountBox");
-  if (box) box.remove();
-  // ==========================
-// INITIAL ROLE-BASED VIEW MODE (runs immediately)
-// ==========================
-const user = Auth.currentUser();
-const viewOnlyBtn = document.getElementById("viewOnlyBtn");
+  saveBar.style.display = "none";
 
-if (user && user.role === "HOD") {
-  saveBtn.style.display = "none";                 // hide Save
-  if (viewOnlyBtn) viewOnlyBtn.style.display = "inline-block"; // show View Only
-} else {
-  saveBtn.style.display = "inline-block";         // show Save
-  if (viewOnlyBtn) viewOnlyBtn.style.display = "none";        // hide View Only
-}
-// ==========================
-// HARD CLEANUP: remove leftover "Mark Class Not Held" bar for HOD
-// ==========================
-if (user && user.role === "HOD") {
-  const oldTopBar = document.getElementById("attendanceTopBar");
-  if (oldTopBar) oldTopBar.remove();
-}
   // --------------------------
   // Load Subjects
   // --------------------------
-    async function loadSubjects() {
+  async function loadSubjects() {
     const subjects = await App.getSubjects();
     const batches = await App.getBatches();
     const enrollments = await App.getEnrollments();
-    const user = Auth.currentUser();
 
     subjectSelect.innerHTML = `<option value="">-- Select Subject --</option>`;
     let allowed = subjects;
 
-   if (user && user.role === "Teacher") {
+    if (isTeacher) {
       const map = await App.getSubjectAssignmentsFromFirestore();
-
       allowed = subjects.filter(s => {
         const isAssigned = String(map[String(s.id)]) === String(user.id);
-        const batch = batches.find(b =>String(b.id) === String(s.batchId) && String(b.semester) === String(s.semester));
-        
+        const batch = batches.find(b => String(b.id) === String(s.batchId) && String(b.semester) === String(s.semester));
         // RULE: Hide ARCHIVED subjects from daily operational screens
-        const isNotArchived = batch && batch.status !== 'ARCHIVED';
-        
-        return isAssigned && isNotArchived;
+        return isAssigned && batch && batch.status !== "ARCHIVED";
       });
     }
 
     if (user && user.role === "Student") {
       const myId = String(user.studentId);
-      allowed = subjects.filter(s =>
-        (enrollments[String(s.id)] || []).map(String).includes(myId)
-      );
+      allowed = subjects.filter(s => (enrollments[String(s.id)] || []).map(String).includes(myId));
     }
 
     allowed.forEach(sub => {
       const batch = batches.find(b => String(b.id) === String(sub.batchId) && String(b.semester) === String(sub.semester));
-      const batchText = batch
-        ? `${batch.program} Batch ${batch.year} Sem ${batch.semester}`
-        : "Unknown Batch";
-
+      const batchText = batch ? `${batch.program} Batch ${batch.year} Sem ${batch.semester}` : "Unknown Batch";
       const opt = document.createElement("option");
       opt.value = sub.id;
       opt.textContent = `${sub.name} (${sub.type} | ${batchText})`;
@@ -3818,177 +3795,119 @@ if (user && user.role === "HOD") {
   }
 
   // --------------------------
-  // Count Helper (TABLE-BASED)
+  // Counts and row status
   // --------------------------
   function updateCount() {
     let p = 0, a = 0, l = 0;
-    document.querySelectorAll("#attendanceTable tbody tr").forEach(tr => {
+    studentList.querySelectorAll("#attendanceTable tbody tr").forEach(tr => {
       const s = tr.dataset.status;
       if (s === "Absent") a++; else if (s === "Leave") l++; else if (s === "Present") p++;
     });
-
-    const box = document.getElementById("attendanceCountBox");
-    if (box) box.textContent = `Present: ${p} | Absent: ${a}` + (l ? ` | Leave: ${l}` : "");
+    countBox.textContent = `Present: ${p} | Absent: ${a}` + (l ? ` | Leave: ${l}` : "");
   }
 
   // Show a status in the table (Present / Absent / Leave (type) / —)
   function setStatus(tr, status, leaveType) {
     tr.dataset.status = status;
     if (leaveType) tr.dataset.leaveType = leaveType; else delete tr.dataset.leaveType;
+    if (status !== "Leave") delete tr.dataset.leaveRef;
+    tr.classList.toggle("is-absent", status === "Absent");
+    tr.classList.toggle("is-leave", status === "Leave");
     const cell = tr.querySelector(".status");
     cell.textContent = status === "Leave" ? `Leave (${App.LEAVE_TYPES[leaveType] || "?"})` : status;
-    cell.style.color = status === "Absent" ? "red" : status === "Leave" ? "#1d4ed8" : status === "Present" ? "green" : "#6b7280";
+    cell.style.color = status === "Absent" ? "#b91c1c" : status === "Leave" ? "#1d4ed8" : status === "Present" ? "green" : "#6b7280";
+  }
+
+  function showMessage(text) {
+    studentList.innerHTML = `<p>${App.esc(text)}</p>`;
+    saveBar.style.display = "none";
   }
 
   // --------------------------
-  // Load Students (EXPLICIT)
+  // Load Students
   // --------------------------
-    async function loadStudents() {
+  async function loadStudents() {
+    const my = ++loadSeq;
+    const stale = () => my !== loadSeq;
     const subjectId = subjectSelect.value;
     const date = dateInput.value;
-    if (!subjectId || !date) {
-    studentList.innerHTML = "";   // 🔥 clear stale UI
-    saveBtn.disabled = true;
-    return;
-    }
 
-    uiLoaded = true;
+    topBar.innerHTML = "";
     saveStatus.textContent = "";
+    uiLoaded = false;
+    if (!subjectId || !date) { showMessage(""); return; }
+    studentList.innerHTML = "<p>Loading…</p>";
+    saveBar.style.display = "none";
 
-    const subjects = await App.getSubjects();
-    const subject = subjects.find(s => String(s.id) === subjectId);
-    if (!subject) return;
-    if (!(await App.isBatchOpen(subject.batchId, subject.semester))) {
-      studentList.innerHTML = "<p>Semester is closed.</p>";
-      saveBtn.disabled = true;
-      return;
-    }
+    const subject = (await App.getSubjects()).find(s => String(s.id) === subjectId);
+    if (stale()) return;
+    if (!subject) { showMessage("Subject not found."); return; }
 
-    if (await App.isClosedDay(date)) {
-      studentList.innerHTML = "<p>Day is closed.</p>";
-      saveBtn.disabled = true;
-      return;
-    }
+    if (!(await App.isBatchOpen(subject.batchId, subject.semester))) { if (!stale()) showMessage("Semester is closed."); return; }
+    if (await App.isClosedDay(date)) { if (!stale()) showMessage("Day is closed."); return; }
+    if (stale()) return;
+    if (date > new Date().toLocaleDateString("en-CA")) { showMessage("Attendance can't be marked for a future date."); return; }
 
-    const todayLocal = new Date().toLocaleDateString("en-CA");   // YYYY-MM-DD, local time
-    if (date > todayLocal) {
-      studentList.innerHTML = "<p>Attendance can't be marked for a future date.</p>";
-      saveBtn.disabled = true;
-      return;
-    }
-// --------------------------
-// Teacher: Mark Class Not Held button
-// --------------------------
+    const cancellation = await App.getClassCancellation(subjectId, date);
+    if (stale()) return;
+    if (cancellation) { showMessage("Class not held."); return; }
 
-if (user && user.role === "HOD") {
-  saveBtn.style.display = "none";
-  if (viewOnlyBtn) viewOnlyBtn.style.display = "inline-block";
-} else {
-  saveBtn.style.display = "inline-block";
-  if (viewOnlyBtn) viewOnlyBtn.style.display = "none";
-}
-
-
-// Create / get top action bar
-let topBar = document.getElementById("attendanceTopBar");
-if (!topBar) {
-  topBar = document.createElement("div");
-  topBar.id = "attendanceTopBar";
-  topBar.style.marginBottom = "10px";
-  studentList.parentNode.insertBefore(topBar, studentList);
-}
-
-topBar.innerHTML = "";
-
-// HOD must NEVER see cancel button (force cleanup)
-if (user && user.role === "HOD") {
-  topBar.remove();   // 👈 remove entire bar from DOM
-}
-
-if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectId, date))) {
-  const btn = document.createElement("button");
-  btn.textContent = "Mark Class Not Held";
-  btn.style.background = "#c0392b";
-  btn.style.color = "white";
-  btn.style.padding = "6px 10px";
-  btn.style.border = "none";
-  btn.style.cursor = "pointer";
-
-  btn.onclick = async function () {
-  const reason = await UI.prompt("Reason for class not held:");
-  if (!reason) return;
-
-  // ✅ Use the REAL cancellation system (same as HOD)
-  const cancelled = await App.cancelClass({
-  subjectId: subjectId,
-  date: date,
-  teacherId: String(user.id),
-  reason: reason
-  });
-
-  UI.alert(cancelled ? "Class marked as not held." : "Could NOT save. Check your internet connection and try again.");
-  await loadStudents(); // refresh UI
-};
-
-
-  topBar.appendChild(btn);
-}
-    if (await App.getClassCancellation(subjectId, date)) {
-      studentList.innerHTML = "<p>Class not held.</p>";
-      saveBtn.disabled = true;
-      return;
-    }
-
-    const enrollments = await App.getEnrollments();
-    const students = await App.getStudents();
-
-      const ids = (enrollments[String(subjectId)] || [])
-      .map(id => students.find(s => String(s.id) === String(id)))
-      .filter(Boolean)
-      .filter(st => !st.status || st.status === "ACTIVE") // 🛡️ Keep this line
-      .sort((a, b) => String(a.roll).localeCompare(String(b.roll))); // 👈 ONLY ONE OF THESE
-
-    const record = await App.getAttendance(subjectId, date);
-    const saved = Object.keys(record || {}).length > 0;
+    const [enrollments, students, record] = await Promise.all([
+      App.getEnrollments(), App.getStudents(), App.getAttendance(subjectId, date)
+    ]);
     App.clearAttendanceCaches();
     const subjData = await App.loadSubjectData(subjectId);     // corrections, leaves, casual counts
     const leaveLimit = await App.getLeaveLimit();
+    if (stale()) return;
+
+    const ids = (enrollments[String(subjectId)] || [])
+      .map(id => students.find(s => String(s.id) === String(id)))
+      .filter(Boolean)
+      .filter(st => !st.status || st.status === "ACTIVE")
+      .sort(App.sortByRoll);     // 1, 2, … 10 (same order as the register)
+    const saved = Object.keys(record || {}).length > 0;
+    const marking = isTeacher && !saved;
+    uiLoaded = true;
+
+    // Rarely needed, so kept quiet; only before attendance is saved
+    if (isTeacher && !saved) {
+      const btn = document.createElement("button");
+      btn.className = "quiet-danger";
+      btn.textContent = "Mark Class Not Held";
+      btn.onclick = async () => {
+        const reason = await UI.prompt("Reason for class not held:");
+        if (!reason) return;
+        const cancelled = await App.cancelClass({ subjectId, date, teacherId: String(user.id), reason });
+        UI.alert(cancelled ? "Class marked as not held." : "Could NOT save. Check your internet connection and try again.");
+        await loadStudents();
+      };
+      topBar.appendChild(btn);
+    }
 
     studentList.innerHTML = `
-      <div id="attendanceCountBox"
-        style="margin-bottom:10px;padding:8px;border:1px solid #ccc;
-               background:#f4f6f8;font-weight:bold;">
-        Present: 0 | Absent: 0
-      </div>
-
-      <table id="attendanceTable" border="1" cellpadding="6"
+      ${marking ? `<div class="attendance-tools">
+          <button type="button" id="allPresentBtn">All present</button>
+          <button type="button" id="allAbsentBtn">All absent</button>
+          <span class="attendance-hint">Tap a student to mark absent; tap again to undo.</span>
+        </div>` : ""}
+      <table id="attendanceTable" class="${marking ? "marking" : ""}" border="1" cellpadding="6"
         style="border-collapse:collapse;width:100%;">
         <thead style="background:#eee;">
-          <tr>
-            <th>S.No</th>
-            <th>Roll</th>
-            <th>Name</th>
-            <th>Status</th>
-            <th>Action</th>
-          </tr>
+          <tr><th>S.No</th><th>Roll</th><th>Name</th><th>Status</th><th>Action</th></tr>
         </thead>
         <tbody></tbody>
-      </table>
-    `;
-
-    const tbody = document.querySelector("#attendanceTable tbody");
+      </table>`;
+    const tbody = studentList.querySelector("#attendanceTable tbody");
 
     ids.forEach((st, i) => {
       const tr = document.createElement("tr");
       tr.dataset.studentId = st.id;
-
       tr.innerHTML = `
         <td>${i + 1}</td>
         <td>${App.esc(st.roll)}</td>
         <td>${App.esc(st.name)}</td>
         <td class="status" style="font-weight:bold;"></td>
-        <td></td>
-      `;
+        <td></td>`;
       const hasEntry = saved && record[String(st.id)] !== undefined;
       if (!saved) setStatus(tr, "Present");
       else if (!hasEntry) setStatus(tr, "—");
@@ -3997,28 +3916,25 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
         const lv = eff === "Leave" ? subjData.leaveOf(date, st.id) : null;
         setStatus(tr, eff, lv ? lv.type : null);
       }
-
       const action = tr.lastElementChild;
 
-        if (Object.keys(record || {}).length === 0 && user.role === "Teacher") {
-        const btn = document.createElement("button");
-
-        btn.textContent = "Toggle";
-  
-        // Present → Absent → Leave → Present
-        btn.onclick = async () => {
-          const s = tr.dataset.status;
-          if (s === "Present") setStatus(tr, "Absent");
-          else if (s === "Absent") {
-            const lv = await App.askLeaveDetails(st.name, subjData.casualUsed(st.id), leaveLimit);
-            if (lv) { setStatus(tr, "Leave", lv.type); tr.dataset.leaveRef = lv.reference; }
-          } else {
-            setStatus(tr, "Present"); delete tr.dataset.leaveRef;
-          }
+      if (marking) {
+        // Tap the row: Present <-> Absent (a leave goes back to Present)
+        tr.onclick = () => {
+          setStatus(tr, tr.dataset.status === "Present" ? "Absent" : "Present");
           updateCount();
         };
-         action.appendChild(btn);
-       } else if (hasEntry && user.role === "Teacher") {
+        const lbtn = document.createElement("button");
+        lbtn.type = "button";
+        lbtn.textContent = "Leave…";
+        lbtn.onclick = async e => {
+          e.stopPropagation();
+          const lv = await App.askLeaveDetails(st.name, subjData.casualUsed(st.id), leaveLimit);
+          if (lv) { setStatus(tr, "Leave", lv.type); tr.dataset.leaveRef = lv.reference; }
+          updateCount();
+        };
+        action.appendChild(lbtn);
+      } else if (hasEntry && isTeacher) {
         // Absent after saving? The approved leave form can be recorded now.
         if (tr.dataset.status === "Absent") {
           const lbtn = document.createElement("button");
@@ -4046,51 +3962,43 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
           const r = await UI.prompt("Reason for correction:");
           if (!r || !r.trim()) return;
           const ok = await App.requestAttendanceCorrection({
-            subjectId,
-            date,
-            studentId: st.id,
-            requestedStatus: wanted,
-            reason: r.trim()
+            subjectId, date, studentId: st.id, requestedStatus: wanted, reason: r.trim()
           });
           UI.alert(ok ? "Request sent to HOD." : "Request could not be sent. Check your connection and try again.");
         };
         action.appendChild(btn);
       }
-
       tbody.appendChild(tr);
     });
 
+    // All present / All absent (students on leave keep their leave)
+    const setAll = status => {
+      tbody.querySelectorAll("tr").forEach(tr => { if (tr.dataset.status !== "Leave") setStatus(tr, status); });
+      updateCount();
+    };
+    const allP = document.getElementById("allPresentBtn"), allA = document.getElementById("allAbsentBtn");
+    if (allP) allP.onclick = () => setAll("Present");
+    if (allA) allA.onclick = () => setAll("Absent");
+
+    // Bottom bar: counts + Save (teacher, not yet saved) / saved note / HOD view-only
     updateCount();
-    // 🔒 Role-based lock for HOD
-    if (user && user.role === "HOD") {
-  saveBtn.disabled = true;
-
-  // Disable all action buttons in the table
-  document.querySelectorAll("#attendanceTable button").forEach(b => {
-    b.disabled = true;
-  });
-
-  const box = document.getElementById("attendanceCountBox");
-  if (box) {
-    box.style.background = "#f2f2f2";
-    box.style.border = "2px solid #999";
-  }
-
-  saveStatus.textContent = "Read-only view (HOD)";
-} else {
-  saveBtn.disabled = Object.keys(record || {}).length > 0;
-}
+    saveBar.classList.toggle("saved", saved);
+    saveBtn.style.display = marking ? "" : "none";
+    saveBtn.disabled = !marking;
+    if (viewOnlyBtn) viewOnlyBtn.style.display = user && user.role === "HOD" ? "inline-block" : "none";
+    if (saved && isTeacher) saveStatus.textContent = "✅ Saved. Changes go through Request Correction.";
+    saveBar.style.display = "";
   }
 
   // --------------------------
-  // Save Attendance (NO RESET)
+  // Save Attendance
   // --------------------------
-     async function saveAttendance() {
+  async function saveAttendance() {
     if (!uiLoaded) return;
 
     const records = {};
     const leavesToSave = [];
-    document.querySelectorAll("#attendanceTable tbody tr").forEach(tr => {
+    studentList.querySelectorAll("#attendanceTable tbody tr").forEach(tr => {
       const s = tr.dataset.status;
       // A leave is recorded as an absence plus a separate leave record
       records[tr.dataset.studentId] = s === "Leave" ? "Absent" : s;
@@ -4106,21 +4014,16 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
     };
 
     saveBtn.disabled = true;
+    saveStatus.textContent = "Saving…";
     const saved = await App.saveAttendanceToFirestore(attendanceRecord);
     if (!saved.ok) {
       saveStatus.textContent = "NOT saved.";
-      UI.alert("Attendance was NOT saved.\n\nCheck your internet connection and try again. " +
+      await UI.alert("Attendance was NOT saved.\n\nCheck your internet connection and try again. " +
             "(If attendance for this class and date was already saved, it cannot be saved again — use Request Correction.)\n\n" +
             "Attendance also can't be saved for a Sunday, a day the HOD closed, a class marked not held, " +
             "a future date, or a semester that is not active.");
       await loadStudents();
       return;
-    }
-
-      const box = document.getElementById("attendanceCountBox");
-      if (box) {
-      box.style.background = "#e6ffe6";
-      box.style.border = "2px solid green";
     }
 
     // Leaves are saved after the attendance itself (each needs the saved attendance)
@@ -4134,13 +4037,10 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
       }
     }
 
-    saveStatus.textContent = "Attendance saved.";
-    const countText = document.getElementById("attendanceCountBox").textContent;
-    await UI.alert("Attendance saved successfully.\n" + countText +
+    await UI.alert("Attendance saved successfully.\n" + countBox.textContent +
       (leaveProblems.length ? `\n\n⚠️ ${leaveProblems.length} leave(s) could not be saved — those students show as Absent. Use "Mark Leave" to add them.` : "") +
       (saved.copiesMissing ? `\n\n⚠️ ${saved.copiesMissing} student(s) won't see this day on their dashboard yet. Ask the HOD to use "Rebuild student copies" (Admin Panel → Settings).` : ""));
-    saveBtn.disabled = true;
-    await loadStudents();   
+    await loadStudents();
   }
 
   await loadSubjects();
