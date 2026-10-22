@@ -459,6 +459,63 @@ hr {
   #loginScreen input { font-size: 16px; }
 }
 
+/* ======================================================
+   ATTENDANCE MARKING (teachers' main screen)
+   ====================================================== */
+#attendanceTopBar { margin: 8px 0 4px; }
+#attendanceTopBar:empty { display: none; }
+
+/* Rare, can't-be-undone actions: visible but not loud */
+button.quiet-danger {
+  background: #fff;
+  border-color: #fca5a5;
+  color: #b91c1c;
+}
+button.quiet-danger:hover { background: #fef2f2; }
+
+.attendance-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 8px 0;
+}
+.attendance-hint { font-size: 13px; color: var(--muted); }
+
+/* While marking, the whole row is the button */
+#attendanceTable.marking tbody tr { cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent; }
+#attendanceTable.marking tbody tr:hover { background: #f8fafc; }
+#attendanceTable tbody tr.is-absent,
+#attendanceTable.marking tbody tr.is-absent:hover { background: #fde8e8; }
+#attendanceTable tbody tr.is-leave,
+#attendanceTable.marking tbody tr.is-leave:hover { background: #e0ecff; }
+
+#attendanceSaveBar {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 12px;
+  padding: 10px 12px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 -4px 12px rgba(15, 23, 42, 0.08);
+}
+#attendanceSaveBar.saved { background: #f0fdf4; border-color: #86efac; }
+#attendanceCountBox { font-weight: bold; }
+#saveStatus { font-size: 13px; color: var(--muted); }
+#viewOnlyBtn { font-weight: bold; color: #555; }
+#saveBtn { margin-left: auto; padding: 10px 22px; font-size: 16px; font-weight: 600; }
+#saveBtn:disabled { opacity: 0.6; cursor: default; }
+
+@media (max-width: 768px) {
+  #saveBtn { flex: 1 1 100%; margin-left: 0; min-height: 48px; }
+}
+
 @media (max-width: 768px) {
   /* Attendance marking (teachers' main screen): whole table fits, no sideways scrolling */
   #student-list { padding-left: 0; margin: 8px 0; }
