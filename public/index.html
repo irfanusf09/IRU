@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Department Attendance System</title>
+  <!-- Installable app (PWA) -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#1f4fd8">
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Attendance">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Print style for official notices -->
+  <style>
+    @media print {
+      body * {
+        visibility: hidden;
+      }
+      #printArea, #printArea * {
+        visibility: visible;
+      }
+      #printArea {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+      }
+    }
+  </style>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.7.1/firebase-firestore-compat.js"></script>
+
+</head>
+
+<body>
+
+<!-- ================= LOGIN SCREEN ================= -->
+<div id="loginScreen" class="login-screen" style="display:none; max-width:360px; margin:60px auto; padding:24px 16px;">
+  <h2>Login</h2>
+
+  <input type="text" id="loginUsername" placeholder="Login ID" autocomplete="username"
+         autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;" />
+  <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password"
+         style="display:block; width:100%; margin-bottom:8px;" />
+
+  <button id="loginBtn" class="primary">Login</button>
+
+  <p id="loginError" style="color:red;"></p>
+  <button class="installAppBtn" style="display:none; margin-top:6px;">📲 Install App</button>
+  <p id="iosInstallHint" style="display:none; font-size:12px; color:#6b7280;">
+    📲 To install on iPhone/iPad: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b>.
+  </p>
+  <p style="font-size:12px; color:#6b7280;">You can log in with your login ID, or with your recovery email if you have confirmed one.</p>
+  <p style="font-size:13px;"><a href="#" id="forgotLink">Forgot password?</a></p>
+  <div id="forgotPanel" style="display:none; margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fff;">
+    <p style="font-size:13px; margin-top:0;">If you have confirmed a recovery email, enter it to get a reset link.
+       Otherwise, ask the HOD to reset your password.</p>
+    <input type="email" id="forgotEmail" placeholder="Your recovery email" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
+    <button id="forgotBtn">Send reset link</button>
+    <p id="forgotMessage" style="font-size:13px;"></p>
+  </div>
+
+  <p style="margin-top:20px; font-size:13px;"><a href="#" id="setupLink" style="display:none;">First-time setup (HOD)</a></p>
+  <div id="setupPanel" style="display:none; margin-top:10px; padding:12px; border:1px solid #ddd; border-radius:6px; background:#fff;">
+    <h3 style="margin-top:0;">First-time setup</h3>
+    <p style="font-size:13px; color:#555;">Create the HOD account. This can only be done once.</p>
+    <input id="setupName" placeholder="HOD name" style="display:block; width:100%; margin-bottom:8px;">
+    <input id="setupLoginId" value="hod" placeholder="Login ID (e.g. hod)" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
+    <input type="password" id="setupPassword" placeholder="Password (at least 8 characters)" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
+    <input type="password" id="setupPassword2" placeholder="Type the password again" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
+    <button id="setupBtn" class="primary">Create HOD account</button>
+    <p id="setupMessage" style="font-size:13px;"></p>
+  </div>
+</div>
+
+<!-- ================= APP CONTAINER ================= -->
+<div id="appContainer" style="display:none;">
+
+  <!-- Phone-only top bar (hidden on computers) -->
+  <div id="mobileTopBar">
+    <button id="menuToggle" aria-label="Open menu">☰ Menu</button>
+    <span id="mobileTitle">Attendance</span>
+  </div>
+
+  <!-- ================= SIDEBAR ================= -->
+  <div id="sidebar">
+    <h2>Menu</h2>
+
+    <button onclick="showSection('hodDashboardSection')">🏠 HOD Dashboard</button>
+    <button onclick="showSection('studentDashboardSection')">Dashboard</button>
+    <button onclick="showSection('attendanceSection')">Attendance</button>
+    <button onclick="showSection('reportsSection')">Reports</button>
+    <button onclick="showSection('defaultersSection')">Defaulters List</button>
+    <button onclick="showSection('adminSection')">Admin Panel</button>
+    <button onclick="showSection('cancelledClassesSection')">Cancelled Classes Log</button>
+    <button onclick="showSection('myRequestsSection')">My Requests</button>
+    <button onclick="showSection('correctionRequestsSection')">Correction Requests</button>
+    <button onclick="showSection('hodCorrectionsSection')">Attendance Correction Register</button>
+    <button onclick="showSection('archiveSection')">🏛️ Archive Room</button>
+    <button onclick="showSection('exitRegistrySection')">🎓 Alumni Registry</button>
+
+
+    <button id="changePasswordBtn">🔑 Change Password</button>
+    <button id="recoveryBtn">📧 Recovery Email</button>
+    <button class="installAppBtn" style="display:none;">📲 Install App</button>
+    <button id="logoutBtn">Logout</button>
+  </div>
+
+  <!-- ================= MAIN CONTENT ================= -->
+  <div id="main">
+
+    <!-- ================= HOD Dashboard ================= -->
+    <div id="hodDashboardSection" class="section">
+      <h1>🏠 HOD Dashboard</h1>
+      <div id="hodDashDate" style="color:#6b7280; font-size:13px; margin-top:-12px;"></div>
+
+  <div id="hodStatsWidget" style="display:flex; gap:20px; margin:20px 0; flex-wrap:wrap;">
+    </div>
+
+<div id="backupBox" style="padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:16px;">
+  <h2 style="margin-top:0;">💾 Backup</h2>
+  <p style="font-size:13px; color:#6b7280; margin:4px 0 8px;">
+    Download a full copy of all data <b>every week</b> and keep the files somewhere safe (e.g. Google Drive and a USB stick).
+    The Excel file is for reading; the exact copy is what a developer needs to restore data.
+  </p>
+  <button id="backupExcelBtn" class="primary">Download backup (Excel)</button>
+  <button id="backupJsonBtn">Download exact copy (for restoring)</button>
+  <p id="backupStatus" style="font-size:13px; margin:8px 0 0;"></p>
+</div>
+
+      <div style="padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:16px;">
+        <h2 style="margin-top:0;">📝 Correction requests</h2>
+        <div id="hodDashCorrections">Loading…</div>
+      </div>
+
+      <div style="padding:12px 14px; border:1px solid #e2e8f0; border-radius:8px; background:#fff; margin-bottom:16px;">
+        <h2 style="margin-top:0;">📋 Today's classes</h2>
+        <p style="font-size:12px; color:#6b7280; margin:4px 0 8px;">
+          Not every subject meets every day — use "Not marked yet" as a reminder to check with the teacher, not as a record.
+        </p>
+        <div id="hodDashToday" style="overflow-x:auto;">Loading…</div>
+      </div>
+    </div>
+
+    <!-- ================= Attendance ================= -->
+    <div id="attendanceSection" class="section active">
+      <h1>Class Attendance</h1>
+
+      <div>
+        <label>Date:</label>
+        <input type="date" id="attendanceDate">
+      </div>
+
+      <br>
+
+      <select id="subjectSelect"></select>
+
+      <ul id="student-list"></ul>
+
+      <button id="saveBtn">Save Attendance</button>
+<span
+  id="viewOnlyBtn"
+  style="display:none; font-weight:bold; color:#555; padding:6px 0; display:inline-block;"
+>
+  View Only (HOD)
+</span>
+<p id="saveStatus"></p>
+    </div>
+
+    <!-- ================= Reports ================= -->
+<div id="reportsSection" class="section">
+
+  <h1>Attendance Reports</h1>
+
+  <!-- ================= CONTROLS ================= -->
+  <div class="controls">
+
+    <!-- Report View Type -->
+    <div style="margin-bottom:15px;">
+      <label>
+        <input type="radio" name="reportViewType" value="summary" checked>
+        Summary Report
+      </label>
+
+      &nbsp;&nbsp;
+
+      <label>
+        <input type="radio" name="reportViewType" value="register">
+        Register View (Classic)
+      </label>
+    </div>
+
+    <div style="margin-bottom:10px;">
+      <label>From:</label>
+      <input type="date" id="fromDate">
+
+      &nbsp;&nbsp;
+
+      <label>To:</label>
+      <input type="date" id="toDate">
+      <div class="quick-dates" style="margin-top:6px;">
+        <button type="button" data-range="this-month">This month</button>
+        <button type="button" data-range="last-month">Last month</button>
+        <button type="button" data-range="since-start">Since first class</button>
+      </div>
+    </div>
+
+    <div style="margin-bottom:10px;">
+      <select id="subjectFilter"></select>
+    </div>
+
+    <div>
+      <button id="generateBtn">Generate Report</button>
+    </div>
+
+  </div>
+  
+  <!-- ================= END CONTROLS ================= -->
+
+
+  <!-- ================= RESULT ================= -->
+  <div class="result">
+    <div id="reportOutput"></div>
+    <div id="registerOutput"></div>
+  </div>
+  <!-- ================= END RESULT ================= -->
+
+
+  <!-- ================= EXPORT ACTIONS ================= -->
+  <div class="export-actions" style="margin-top:20px;">
+
+<button id="exportExcelBtn" class="primary">Export to Excel</button>
+<button id="exportPdfBtn" class="primary">Export to PDF</button>
+  </div>
+  <!-- ================= END EXPORT ACTIONS ================= -->
+
+</div>
+
+
+
+    <!-- ================= My Requests (Teacher) ================= -->
+   <div id="myRequestsSection" class="section">
+      <h2>My Correction Requests</h2>
+      <div id="myRequestsOutput"></div>
+    </div>
+
+<!-- ================= Defaulters ================= -->
+<div id="defaultersSection" class="section">
+  <h1>Defaulters List (Below 75%)</h1>
+
+  <label>Select Batch:</label>
+  <select id="defaulterBatchSelect"></select>
+
+  <button id="generateDefaultersBtn">Generate List</button>
+
+  <div id="defaultersOutput" style="margin-top:15px;"></div>
+
+  <br>
+
+  <button id="exportDefaultersExcelBtn">Export to Excel</button>
+  <button id="printDefaultersNoticeBtn">Print Official Notice</button>
+</div>
+
+<!-- ================= Student Dashboard ================= -->
+<div id="studentDashboardSection" class="section">
+  <h1>My Attendance Dashboard</h1>
+
+  <div id="studentInfoBox" style="margin-bottom:15px;"></div>
+
+  <h3>Subject-wise Attendance</h3>
+  <div id="studentDashboardOutput"></div>
+
+  <div id="studentRegisterBox" style="display:none; margin-top:25px; padding-top:15px; border-top:1px solid #e2e8f0;">
+    <h3>My day-by-day register</h3>
+    <select id="studentRegSubject" style="max-width:100%;"></select>
+    <input type="month" id="studentRegMonth">
+    <button id="studentRegBtn">Show</button>
+    <div id="studentRegOutput" style="margin-top:10px; overflow-x:auto;"></div>
+  </div>
+</div>
+
+<!-- ================= Admin ================= -->
+  <div id="adminSection" class="section">
+  <h1>Admin Panel</h1>
+  <div class="admin-tabs" id="adminTabs" role="tablist">
+    <button type="button" data-tab="batches" role="tab">📚 Batches & Subjects</button>
+    <button type="button" data-tab="teachers" role="tab">👩‍🏫 Teachers</button>
+    <button type="button" data-tab="students" role="tab">🎓 Students</button>
+    <button type="button" data-tab="logins" role="tab">🔑 Student Logins</button>
+    <button type="button" data-tab="closures" role="tab">🗓️ Day Closures</button>
+    <button type="button" data-tab="settings" role="tab">⚙️ Settings</button>
+  </div>
+
+  <div class="admin-tab" data-tab="batches" role="tabpanel">
+  <h2>Batch / Semester Manager</h2>
+
+  <select id="batchProgram">
+    <option value="UG">UG</option>
+    <option value="IG">IG</option>
+    <option value="PG">PG</option>
+  </select>
+<input type="number" id="batchYear" placeholder="Batch Year (e.g. 2020)" min="2000">
+<select id="batchSemester">
+  <option value="">Select Semester</option>
+</select>
+
+  <button id="addBatchBtn">Add Batch</button>
+
+  <ul id="batchList"></ul>
+
+  <hr>
+  <h2>Subject (Course) Manager</h2>
+<select id="courseTemplateSelect">
+  <option value="">Select Course Template</option>
+</select>
+
+  <input type="text" id="subjectNameInput" placeholder="Subject name">
+
+  <select id="subjectBatchSelect"></select>
+
+  <select id="subjectTypeSelect">
+  <option value="MAJOR">Major</option>
+  <option value="MINOR">Minor</option>
+  <option value="CORE">Core</option>
+  <option value="MD">Multidisciplinary</option>
+  <option value="SKILL">Skill</option>
+  <option value="ELECTIVE">Elective</option>
+  <option value="OTHER">Other</option>
+</select>
+
+
+  <button id="addSubjectBtn">Add Subject</button>
+
+  <ul id="subjectList"></ul>
+
+  </div>
+
+  <div class="admin-tab" data-tab="teachers" role="tabpanel">
+  <h2>Teacher Account Manager</h2>
+  <input type="file" id="teacherExcelFile" accept=".xlsx,.xls">
+<button id="uploadTeacherExcelBtn">Upload Teachers (Excel)</button>
+<p id="teacherUploadStatus"></p>
+
+<hr>
+  <input type="text" id="teacherNameInput" placeholder="Teacher name">
+  <input type="text" id="teacherUsernameInput" placeholder="Username">
+  <input type="text" id="teacherPasswordInput" placeholder="Starting password (min 6)">
+
+  <button id="addTeacherBtn">Add Teacher</button>
+
+  <ul id="teacherList"></ul>
+
+  <hr>
+  <h2>Assign Subject to Teacher</h2>
+
+  <select id="assignTeacherSelect"></select>
+  <select id="assignSubjectSelect"></select>
+
+  <button id="assignSubjectBtn">Assign</button>
+
+  <ul id="teacherAssignmentList"></ul>
+
+  </div>
+
+  <div class="admin-tab" data-tab="students" role="tabpanel">
+  <h2>Student Upload (Per Course Excel)</h2>
+
+  <select id="studentUploadBatchSelect"></select>
+  <select id="studentUploadSubjectSelect"></select>
+
+  <br><br>
+
+  <input type="file" id="excelFile" accept=".xlsx, .xls" />
+  <button id="uploadExcelBtn">Upload Students</button>
+
+  <p id="uploadStatus"></p>
+
+  <hr>
+<h2>Student Manager (Manual)</h2>
+
+<div style="margin-bottom:10px;">
+  <select id="studentManagerBatchSelect"></select>
+  <select id="studentManagerSubjectSelect"></select>
+  <button id="loadStudentManagerBtn">Load Students</button>
+</div>
+
+<div id="studentManagerOutput"></div>
+
+<hr>
+
+<h3>Add Student Manually</h3>
+
+<input type="text" id="manualStudentName" placeholder="Student name">
+<input type="text" id="manualStudentRoll" placeholder="Roll number">
+<button id="addManualStudentBtn">Add Student</button>
+
+<p id="manualStudentStatus"></p>
+
+  </div>
+
+  <div class="admin-tab" data-tab="logins" role="tabpanel">
+<h2>Student Logins</h2>
+<p style="font-size:13px; color:#6b7280;">
+  Each student logs in with a Login ID made from programme, batch year and roll number
+  (e.g. <b>ug2025-07</b>) and a starting password that is shown once, to print or download.
+</p>
+<select id="studentLoginBatchSelect"></select>
+<button id="loadStudentLoginsBtn" onclick="App.Accounts.renderStudentLogins()">Show students</button>
+<button id="createStudentLoginsBtn" onclick="App.Accounts.createStudentLogins()">Create logins for students without one</button>
+<div id="studentLoginsOutput" style="margin-top:10px; overflow-x:auto;"></div>
+
+
+  </div>
+
+  <div class="admin-tab" data-tab="settings" role="tabpanel">
+<h2>Leave settings</h2>
+<p style="font-size:13px; color:#6b7280;">
+  Casual leave is limited per subject per semester. Medical, NCC and Other leave are not limited.
+  Leave days are left out of the attendance percentage.
+</p>
+<label for="casualLeaveLimitInput">Casual leaves allowed per subject per semester:</label>
+<input type="number" id="casualLeaveLimitInput" min="0" max="60" step="1" style="width:90px;">
+<button id="saveLeaveLimitBtn" onclick="App.Settings.save()">Save</button>
+  </div>
+
+  <div class="admin-tab" data-tab="closures" role="tabpanel">
+<h2>Day Closure Manager</h2>
+
+<input type="date" id="closedDayDate">
+
+<select id="closedDayType">
+  <option value="weather">Weather Issue</option>
+  <option value="admin">Administrative Closure</option>
+  <option value="emergency">Emergency</option>
+  <option value="event">Department Event</option>
+  <option value="custom">Custom</option>
+</select>
+
+<input type="text" id="closedDayReason" placeholder="Enter reason">
+
+<button id="addClosedDayBtn">Mark Day Closed</button>
+
+<ul id="closedDayList"></ul>
+
+
+
+  </div>
+
+</div>
+<!-- ================= CANCELLED CLASSES LOG (HOD) ================= -->
+<div id="cancelledClassesSection" class="section">
+  <h1>Cancelled Classes Log (View Only)</h1>
+  <div id="cancelledClassesLog"></div>
+</div>
+
+<!-- ================= CORRECTION REQUESTS (HOD) ================= -->
+<div id="correctionRequestsSection" class="section">
+  <h2>Correction Requests (HOD)</h2>
+  <div id="correctionRequestsOutput"></div>
+</div>
+
+<!-- ================= ATTENDANCE CORRECTION REGISTER (HOD) ================= -->
+<div id="hodCorrectionsSection" class="section">
+  <h2>Attendance Correction Register</h2>
+  <div id="hodCorrectionsOutput"></div>
+
+  <h2 style="margin-top:28px;">Leave Register</h2>
+  <p style="font-size:13px; color:#6b7280;">Every leave recorded by teachers. Removing one makes that day count as Absent again.</p>
+  <div id="leaveRegisterOutput" style="overflow-x:auto;"></div>
+</div>
+
+<div id="archiveSection" class="section">
+  <h2>Digital Archive Room</h2>
+  <p style="color: #666;">Access historical records for archived semesters and former staff.</p>
+  
+ <div style="flex: 1; min-width: 150px;">
+  <label style="display:block; font-size: 12px; font-weight: bold;">Batch Year</label>
+  <select id="archiveYearFilter" style="padding: 8px; border-radius: 4px; width: 100%;">
+    <option value="all">All Years</option>
+    </select>
+</div>
+    
+    <div>
+      <label style="display:block; font-size: 12px; font-weight: bold;">Program</label>
+      <select id="archiveProgramFilter" style="padding: 8px; border-radius: 4px;">
+        <option value="all">All Programs</option>
+        <option value="UG">UG</option>
+        <option value="PG">PG</option>
+        <option value="IG">IG</option>
+      </select>
+    </div>
+
+    <button id="archiveSearchBtn" style="background:#2c3e50; color:white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-top: 15px;">
+      🔍 Search Archive
+    </button>
+    <div id="archiveResults" style="margin-top:20px"></div>
+
+  <!-- NEW: read-only register output for archive -->
+  <div id="archiveRegisterOutput" style="margin-top: 15px;"></div>
+</div>
+<div id="exitRegistrySection" class="section">
+  <h1>🏛️ Student Exit & Alumni Registry</h1>
+  
+  <div style="background:#f4f6f8; padding:20px; border-radius:8px; border:1px solid #ddd;">
+    <p style="font-size:0.9em; color:#666;">
+      Official record of Graduated, Degree Completed, and Dropped students.
+    </p>
+    
+    <button id="loadExitRegistryBtn" style="background:#2c3e50; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer;">
+      View All Exited Students
+    </button>
+    
+    <button onclick="App.downloadAlumniPDF()" style="background:#27ae60; color:white; padding:10px 20px; border:none; border-radius:4px; cursor:pointer; margin-left:10px;">
+      📥 Download Official PDF
+    </button>
+
+    <div id="exitRegistryOutput" style="margin-top:20px; background:white; min-height:100px; border:1px solid #eee;">
+      </div>
+  </div>
+</div>
+
+<!-- ================= END OF MAIN ================= -->
+  </div> <!-- closes #main -->
+</div>   <!-- closes #appContainer -->
+
+
+
+<!-- ================= CHANGE PASSWORD PANEL ================= -->
+<div id="passwordPanel" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.45); z-index:10000; align-items:center; justify-content:center; padding:16px;">
+  <div style="background:#fff; border-radius:8px; padding:20px; width:100%; max-width:360px; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
+    <h2 id="passwordPanelTitle" style="margin-top:0;">Change password</h2>
+    <p id="passwordPanelNote" style="font-size:13px; color:#555;"></p>
+    <div id="currentPasswordRow">
+      <input type="password" id="pwCurrent" placeholder="Current password" autocomplete="current-password" style="display:block; width:100%; margin-bottom:8px;">
+    </div>
+    <input type="password" id="pwNew" placeholder="New password (at least 6 characters)" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
+    <input type="password" id="pwConfirm" placeholder="Type the new password again" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
+    <p id="pwMessage" style="font-size:13px; min-height:18px;"></p>
+    <button id="pwSaveBtn" class="primary">Save password</button>
+    <button id="pwCancelBtn">Cancel</button>
+  </div>
+</div>
+
+<!-- ================= RECOVERY EMAIL PANEL ================= -->
+<div id="recoveryPanel" style="display:none; position:fixed; inset:0; background:rgba(15,23,42,0.45); z-index:10000; align-items:center; justify-content:center; padding:16px;">
+  <div style="background:#fff; border-radius:8px; padding:20px; width:100%; max-width:380px; box-shadow:0 10px 30px rgba(0,0,0,0.2);">
+    <h2 style="margin-top:0;">Recovery email</h2>
+    <p id="recoveryStatus" style="font-size:13px; color:#374151;"></p>
+    <input type="email" id="recEmail" placeholder="Your email address" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
+    <input type="password" id="recPassword" placeholder="Your current password" autocomplete="current-password" style="display:block; width:100%; margin-bottom:8px;">
+    <p id="recMessage" style="font-size:13px; min-height:18px;"></p>
+    <button id="recSaveBtn" class="primary">Send confirmation link</button>
+    <button id="recCloseBtn">Close</button>
+  </div>
+</div>
+
+<!-- ================= LIBRARIES ================= -->
+<script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+<script src="ui.js"></script>
+<script src="firebase-config.js"></script>
+<script src="app.js"></script>
+<script src="pwa.js"></script>
+
+</body>
+</html>

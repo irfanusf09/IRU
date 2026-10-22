@@ -1,0 +1,548 @@
+/* ================= FOUNDATION ================= */
+
+:root {
+  /* Overall background (soft, not white) */
+  --bg: #f1f5f9;              /* soft grey-blue */
+
+  /* Main panels (off-white, easy on eyes) */
+  --panel: #f8fafc;           /* NOT pure white */
+
+  /* Text */
+  --ink: #111827;
+  --muted: #6b7280;
+
+  /* Borders */
+  --border: #e2e8f0;
+
+  /* Sidebar */
+  --sidebar-bg: #eef2f7;
+
+  /* Secondary buttons (calm) */
+  --btn-bg: #e8edff;          /* muted blue-grey */
+  --btn-bg-hover: #dde3ff;
+
+  /* Primary actions (still clear, not harsh) */
+  --primary: #1f4fd8;         /* slightly softened blue */
+  --primary-hover: #1e40af;
+
+  --radius: 8px;
+}
+
+/* ================= RESET ================= */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* ================= LAYOUT ================= */
+
+#appContainer {
+  display: flex;
+  height: 100vh;
+}
+
+/* ================= SIDEBAR ================= */
+
+#sidebar {
+  width: 240px;
+  background: linear-gradient(180deg, #eef2ff, #f8fafc);
+  border-right: 1px solid var(--border);
+  padding: 16px;
+}
+
+#sidebar h2 {
+  text-align: center;
+  margin-bottom: 20px;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+#sidebar button {
+  width: 100%;
+  padding: 8px 10px;
+  margin: 4px 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--ink);
+  text-align: left;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+#sidebar button:hover {
+  background: #e0e7ff;
+}
+
+/* ================= MAIN ================= */
+
+#main {
+  flex: 1;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+/* ================= SECTIONS ================= */
+
+.section {
+  display: none;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 24px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+}
+
+.section.active {
+  display: block;
+}
+
+/* ================= HEADINGS ================= */
+
+h1 {
+  font-size: 20px;
+  margin: 0 0 20px 0;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+h2 {
+  font-size: 15px;
+  margin: 20px 0 8px 0;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+/* ================= FORMS ================= */
+
+label {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+input, select {
+  padding: 7px 9px;
+  border-radius: 6px;
+  border: 1px solid #d1d5db;
+  font-size: 14px;
+  background: white;
+  color: var(--ink);
+}
+
+input:focus, select:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 1px rgba(37,99,235,0.25);
+}
+
+/* ================= BUTTONS ================= */
+
+/* ================= BUTTONS ================= */
+
+/* Default buttons (calm, non-glary) */
+button {
+  padding: 7px 12px;
+  border-radius: 6px;
+  border: 1px solid #bfdbfe;
+  background: var(--btn-bg);
+  color: #1e40af;
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--btn-bg-hover);
+}
+
+button.primary {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: white;
+}
+
+
+button.primary:hover,
+#generateBtn:hover {
+  background: var(--primary-hover);
+}
+
+
+/* ================= LISTS ================= */
+
+li {
+  list-style: none;
+  background: #ffffff;
+  padding: 8px 10px;
+  margin-bottom: 8px;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.status {
+  margin-left: auto;
+  font-weight: 600;
+}
+
+/* ================= TABLES ================= */
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  background: #ffffff;
+  border: 1px solid var(--border);
+}
+
+th {
+  background: #f1f5f9;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+td, th {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  text-align: center;
+}
+
+/* ================= HR ================= */
+
+hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 20px 0;
+}
+
+/* ================= REPORTS SCREEN ================= */
+
+#reportsSection .controls {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+
+  border: none;
+  padding: 0;
+  margin-bottom: 16px;
+  border-radius: 0;
+  background: transparent;
+}
+
+#reportsSection #generateBtn {
+  grid-column: 1 / -1;
+  justify-self: start;
+}
+#reportsSection .result {
+  margin-top: 16px;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  min-height: auto;
+}
+
+/* Inner outputs = plain content */
+#reportsSection #reportOutput,
+#reportsSection #registerOutput {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+
+/* ================= PDF SUPPORT ================= */
+
+.pdf-page {
+  page-break-before: always;
+  break-before: page;
+  padding-top: 20px;
+}
+
+.pdf-page:first-child {
+  page-break-before: auto;
+  break-before: auto;
+}
+/* ================= FINAL UI AUTHORITY OVERRIDES ================= */
+
+/* 1. Sidebar: solid soft color (no gradient) */
+#sidebar {
+  background: #eef2f7;   /* calm, solid, soft */
+}
+
+/* 2. Sidebar buttons should look like real buttons */
+#sidebar button {
+  background: #ffffff;
+  border: 1px solid #dbe2ea;
+  color: #0f172a;
+}
+
+#sidebar button:hover {
+  background: #e0e7ff;
+  border-color: #c7d2fe;
+}
+/* ==========================
+   Remove fieldset / legend box (Reports)
+   ========================== */
+
+#reportsSection fieldset {
+  border: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+#reportsSection legend {
+  padding: 0;
+  margin: 0 0 8px 0;
+  font-weight: 600;
+}
+/* ==========================
+   Reports Section: flat layout
+   ========================== */
+
+#reportsSection.section {
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+/* Reports section: calmer buttons */
+#reportsSection button {
+  background: var(--btn-bg);
+  border-color: #bfdbfe;
+  color: #1e40af;
+}
+
+#reportsSection button:hover {
+  background: var(--btn-bg-hover);
+}
+/* ==========================
+   Register: force month fit
+   ========================== */
+
+/* Default: allow scroll */
+#registerOutput {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* Compress cells safely */
+#registerOutput th,
+#registerOutput td {
+  padding: 3px;
+  font-size: 11px;
+  text-align: center;
+  white-space: nowrap;
+}
+
+/* Name column slightly wider */
+#registerOutput th:nth-child(3),
+#registerOutput td:nth-child(3) {
+  text-align: left;
+  width: 140px;
+}
+
+/* Roll + S.No compact */
+#registerOutput th:nth-child(1),
+#registerOutput td:nth-child(1),
+#registerOutput th:nth-child(2),
+#registerOutput td:nth-child(2) {
+  width: 50px;
+}
+
+/* ======================================================
+   PHONE LAYOUT (screens narrower than 768px)
+   Menu folds behind a "☰ Menu" button; content uses full width.
+   Computers are not affected by anything below.
+   ====================================================== */
+#mobileTopBar { display: none; }
+
+@media (max-width: 768px) {
+  #appContainer {
+    flex-direction: column;
+    height: auto;
+    min-height: 100vh;
+  }
+
+  #mobileTopBar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    position: sticky;
+    top: 0;
+    z-index: 500;
+    background: #1f4fd8;
+    color: #fff;
+    padding: 10px 12px;
+    padding-top: calc(10px + env(safe-area-inset-top));
+    box-shadow: 0 1px 4px rgba(0,0,0,0.15);
+  }
+  #menuToggle {
+    background: rgba(255,255,255,0.15);
+    border: 1px solid rgba(255,255,255,0.45);
+    color: #fff;
+    font-size: 16px;
+    padding: 8px 12px;
+  }
+  #menuToggle:hover { background: rgba(255,255,255,0.25); }
+  #mobileTitle { font-weight: 600; font-size: 16px; }
+
+  /* "Logged in as" sits inside the blue bar, top-right */
+  body.mobile-ready #roleBadge {
+    top: calc(14px + env(safe-area-inset-top)) !important;
+    right: 12px !important;
+    z-index: 600 !important;
+    background: rgba(255,255,255,0.2) !important;
+    font-size: 11px !important;
+  }
+
+  /* Menu: full width; folded away (until "☰ Menu" is tapped) ONLY when the
+     ☰ button is confirmed present — so a file mismatch can never hide the menu */
+  #sidebar {
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 10px 12px 14px;
+  }
+  body.mobile-ready #sidebar { display: none; }
+  body.mobile-ready.menu-open #sidebar { display: block; }
+  #sidebar h2 { display: none; }
+  #sidebar button { padding: 11px 12px; font-size: 15px; margin: 3px 0; }
+
+  /* Content: full width, comfortable spacing */
+  #main { padding: 10px; overflow: visible; }
+  .section { padding: 14px; }
+  h1 { font-size: 19px; }
+
+  /* Form fields full width and easy to tap */
+  #main input:not([type=checkbox]):not([type=radio]):not([type=file]),
+  #main select {
+    width: 100%;
+    max-width: 100%;
+    margin: 4px 0;
+    font-size: 16px;            /* stops iPhone zooming in on tap */
+  }
+  #main input[type=file] { max-width: 100%; margin: 4px 0; }
+  /* iPhone: date boxes otherwise stick out past the right edge */
+  #main input[type=date], #main input[type=month] {
+    -webkit-appearance: none;
+    appearance: none;
+    display: block;
+    min-width: 0;
+    min-height: 42px;
+    text-align: left;
+  }
+  #main ul { padding-left: 0; }
+  #main button { min-height: 40px; margin: 3px 3px 3px 0; }
+
+  /* Wide tables scroll sideways inside their box instead of breaking the page */
+  #main table {
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  /* Lists: let long text wrap above its buttons */
+  li { flex-wrap: wrap; }
+
+  /* Reports controls: one column */
+  #reportsSection .controls { grid-template-columns: 1fr; }
+
+  /* Login screen inputs */
+  #loginScreen input { font-size: 16px; }
+}
+
+@media (max-width: 768px) {
+  /* Attendance marking (teachers' main screen): whole table fits, no sideways scrolling */
+  #student-list { padding-left: 0; margin: 8px 0; }
+  #main #attendanceTable {
+    display: table;
+    width: 100%;
+    font-size: 14px;
+  }
+  #attendanceTable th, #attendanceTable td { padding: 6px 4px; }
+  #attendanceTable th:first-child, #attendanceTable td:first-child { width: 28px; }
+  #attendanceTable td:nth-child(3) { text-align: left; }
+  #attendanceTable button { min-height: 40px; padding: 6px 10px; margin: 0; }
+}
+
+/* ======================================================
+   IN-APP DIALOGS (replace the browser's grey pop-ups)
+   ====================================================== */
+#uiDialog {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 20000;
+  background: rgba(15, 23, 42, 0.45);
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+}
+#uiDialog.open { display: flex; animation: uiFade .12s ease-out; }
+@keyframes uiFade { from { opacity: 0; } to { opacity: 1; } }
+#uiDialog .ui-card {
+  background: #fff;
+  width: 100%;
+  max-width: 420px;
+  max-height: 85vh;
+  overflow-y: auto;
+  border-radius: 10px;
+  padding: 20px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+}
+#uiDialog .ui-title { font-size: 17px; font-weight: 600; margin-bottom: 8px; color: #0f172a; }
+#uiDialog .ui-msg { font-size: 15px; line-height: 1.5; color: #1f2937; white-space: pre-line; word-wrap: break-word; }
+#uiDialog .ui-input { display: block; width: 100%; margin-top: 12px; font-size: 16px; padding: 9px 10px; }
+#uiDialog .ui-choices { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+#uiDialog .ui-choice { text-align: left; padding: 11px 12px; font-size: 15px; }
+#uiDialog .ui-buttons { margin-top: 18px; display: flex; justify-content: flex-end; gap: 8px; }
+#uiDialog .ui-buttons button { min-width: 84px; padding: 9px 14px; font-size: 15px; }
+#uiDialog .ui-ok.ui-danger { background: #c0392b; border-color: #c0392b; color: #fff; }
+#uiDialog .ui-ok.ui-danger:hover { background: #a93226; }
+
+/* ======================================================
+   ADMIN PANEL TABS
+   ====================================================== */
+.admin-tabs {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+}
+.admin-tabs button {
+  background: #fff;
+  border: 1px solid #dbe2ea;
+  color: #0f172a;
+  border-radius: 999px;
+  padding: 7px 14px;
+}
+.admin-tabs button.active {
+  background: var(--primary);
+  border-color: var(--primary);
+  color: #fff;
+}
+.admin-tab { display: none; }
+.admin-tab.active { display: block; }
+.admin-tab > h2:first-child { margin-top: 4px; }
+
+@media (max-width: 768px) {
+  .admin-tabs {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    margin-left: -2px;
+    margin-right: -2px;
+  }
+  .admin-tabs button { flex: 0 0 auto; min-height: 38px; }
+  #uiDialog .ui-buttons button { flex: 1; }
+}
