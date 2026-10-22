@@ -21,10 +21,12 @@ There is no build step and no server code.
 
 ## Deploying
 
-```sh
-firebase deploy            # hosting + Firestore rules
-```
+| Project | ID | Deploy with |
+|---------|----|-------------|
+| Real | `attendance-system-df860` | `firebase deploy` |
+| Test | `attendance-system-demo-cbec9` | `firebase deploy -P test` |
 
-Note: `.firebaserc` (deploy target) and `public/firebase-config.js` (project the app
-connects to) currently name **different** Firebase projects. Make them match before
-relying on a deploy.
+Each deploy sends hosting + Firestore rules to that project.
+
+`public/firebase-config.js` picks the project from the address the app is opened at:
+the test project's addresses and `localhost` use **test**; everything else uses **real**.

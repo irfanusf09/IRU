@@ -1,5 +1,6 @@
 {
   "projects": {
-    "default": "attendance-system-df860"
+    "default": "attendance-system-df860",
+    "test": "attendance-system-demo-cbec9"
   }
 }
