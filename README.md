@@ -30,3 +30,25 @@ Each deploy sends hosting + Firestore rules to that project.
 
 `public/firebase-config.js` picks the project from the address the app is opened at:
 the test project's addresses and `localhost` use **test**; everything else uses **real**.
+
+## Testing the database rules
+
+`tests/rules.test.mjs` checks `firestore.rules` against Google's Firestore emulator
+(needs Node.js and Java):
+
+```sh
+cd tests
+npm install
+npm test
+```
+
+Run it after any change to `firestore.rules`, before deploying.
+
+## Students' attendance copies
+
+Students may only see their own attendance. Each class's attendance is one document
+for the whole class, so each student also gets a personal copy per subject
+(collection `studentViews`), written automatically when attendance, leave or an
+approved correction is saved. The HOD can recreate all copies from the original
+records with **Admin Panel → Settings → Rebuild student copies** — needed once after
+this feature is first deployed to a project that already has attendance.

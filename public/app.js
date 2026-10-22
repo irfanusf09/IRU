@@ -228,23 +228,34 @@ App.getTeachersFromFirestore = async function () {
     return [];
   }
 };
-App.saveAttendanceToFirestore= async function(record) {
+// Saves the class's attendance together with each student's own copy (studentViews).
+// Returns { ok, copiesMissing } — copiesMissing > 0 means the attendance is saved
+// but some students won't see this day until the HOD runs "Rebuild".
+App.saveAttendanceToFirestore = async function (record) {
+  const ref = db.collection("attendance").doc(`${record.subjectId}_${record.date}`);
+  const copies = Object.keys(record.records).map(studentId =>
+    App.StudentViews.dayWrite(studentId, record.subjectId, record.date, record.records[studentId]));
+
   try {
+    const batch = db.batch();
+    batch.set(ref, record);
+    copies.forEach(c => batch.set(c.ref, c.data, { merge: true }));
+    await batch.commit();
+    return { ok: true, copiesMissing: 0 };
+  } catch (e) {
+    console.warn("Saving attendance with student copies failed", e);
+    if (!e || e.code !== "permission-denied") return { ok: false };
+  }
 
-    const docId = `${record.subjectId}_${record.date}`;
-
-    await db.collection("attendance")
-      .doc(docId)
-      .set(record);
-
-    console.log("Attendance saved to Firestore:", docId);
-
-    return true;
-
+  // Refused as a whole: save the attendance alone, then the copies one by one
+  try {
+    await ref.set(record);
   } catch (e) {
     console.warn("Firestore save failed", e);
-    return false;
+    return { ok: false };
   }
+  const results = await Promise.allSettled(copies.map(c => c.ref.set(c.data, { merge: true })));
+  return { ok: true, copiesMissing: results.filter(r => r.status === "rejected").length };
 };
 App.addTeacherToFirestore = async function(teacher) {
   try {
@@ -663,6 +674,101 @@ App.saveLeave = async function ({ subjectId, date, studentId, type, reference })
     reference: reference || "", markedBy: String(user.id || ""), markedAt: new Date().toISOString()
   };
   await db.collection("leaves").doc(App.leaveDocId(data.subjectId, date, data.studentId)).set(data);
+  // The leave itself is saved; a missing copy is repaired by the HOD's "Rebuild"
+  await App.StudentViews.ref(data.studentId, data.subjectId)
+    .set({ studentId: data.studentId, subjectId: data.subjectId, leaves: { [date]: type }, last: date }, { merge: true })
+    .catch(e => console.warn("Student copy of leave not saved", e));
+};
+
+// ==========================
+// Students' own attendance copies (collection "studentViews")
+//   Students may not read class-wide attendance, so each student has one
+//   document per subject with only their own entries:
+//   { studentId, subjectId, days: {date: status}, leaves: {date: type},
+//     corrections: {date: correctedStatus}, last }
+//   Teachers write days/leaves as they save; the HOD writes corrections and
+//   can rebuild every copy from the original records.
+// ==========================
+App.StudentViews = {};
+
+App.StudentViews.ref = (studentId, subjectId) =>
+  db.collection("studentViews").doc(`${studentId}_${subjectId}`);
+
+App.StudentViews.dayWrite = (studentId, subjectId, date, status) => ({
+  ref: App.StudentViews.ref(studentId, subjectId),
+  data: { studentId: String(studentId), subjectId: String(subjectId), days: { [date]: status }, last: date }
+});
+
+// The logged-in student's copies, { subjectId: copy }, cached for 20 seconds
+App.StudentViews.mine = async function () {
+  const now = Date.now();
+  if (App._viewsCache && now - App._viewsCache.at < 20000) return App._viewsCache.map;
+  const user = Auth.currentUser() || {};
+  const snap = await db.collection("studentViews").where("studentId", "==", String(user.studentDocId)).get();
+  const map = {};
+  snap.forEach(doc => { map[String(doc.data().subjectId)] = doc.data(); });
+  App._viewsCache = { at: now, map };
+  return map;
+};
+
+App.StudentViews.setCorrection = function (studentId, subjectId, date, status) {
+  return App.StudentViews.ref(studentId, subjectId)
+    .set({ studentId: String(studentId), subjectId: String(subjectId), corrections: { [date]: status } }, { merge: true });
+};
+
+App.StudentViews.removeLeave = function (studentId, subjectId, date) {
+  return App.StudentViews.ref(studentId, subjectId)
+    .update(new firebase.firestore.FieldPath("leaves", date), firebase.firestore.FieldValue.delete());
+};
+
+// HOD: recreate every copy from attendance, approved corrections and leaves
+App.StudentViews.rebuild = async function (onProgress) {
+  const read = async c => { const out = []; (await db.collection(c).get()).forEach(d => out.push(d.data())); return out; };
+  if (onProgress) onProgress("Reading attendance…");
+  const [attendance, corrections, leaves] = await Promise.all([read("attendance"), read("attendanceCorrections"), read("leaves")]);
+
+  const views = {};
+  const view = (studentId, subjectId) => {
+    const id = `${studentId}_${subjectId}`;
+    return views[id] = views[id] ||
+      { studentId: String(studentId), subjectId: String(subjectId), days: {}, leaves: {}, corrections: {} };
+  };
+  attendance.forEach(a => Object.entries(a.records || {}).forEach(([sid, status]) => {
+    view(sid, a.subjectId).days[a.date] = status;
+  }));
+  // Same rule as the attendance engine: approved corrections only, latest wins
+  corrections
+    .filter(c => c.decision !== "Rejected" && App.normalizeStatus(c.correctedStatus))
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
+    .forEach(c => { view(c.studentId, c.subjectId).corrections[c.date] = c.correctedStatus; });
+  leaves.forEach(l => { view(l.studentId, l.subjectId).leaves[l.date] = l.type; });
+
+  const writes = Object.entries(views).map(([id, data]) => ({ collection: "studentViews", id, data }));
+  if (onProgress) onProgress(`Saving ${writes.length} student copies…`);
+  await App.commitWrites(writes);
+  App._viewsCache = null;
+  return writes.length;
+};
+
+App.StudentViews.initRebuildButton = function () {
+  const btn = document.getElementById("rebuildViewsBtn");
+  const status = document.getElementById("rebuildViewsStatus");
+  if (!btn || !status) return;
+  btn.onclick = async () => {
+    btn.disabled = true;
+    status.style.color = "#555";
+    try {
+      const n = await App.StudentViews.rebuild(text => { status.textContent = text; });
+      status.style.color = "green";
+      status.textContent = `✅ Rebuilt ${n} student attendance copies.`;
+    } catch (e) {
+      console.error(e);
+      status.style.color = "red";
+      status.textContent = "Rebuild FAILED: " + App.Accounts.errorText(e);
+    } finally {
+      btn.disabled = false;
+    }
+  };
 };
 
 // All class cancellations, as a list
@@ -736,12 +842,18 @@ App._getCorrectionsCached = async function () {
 };
 App.clearAttendanceCaches = function () {
   App._corrCache = null;
+  App._viewsCache = null;
   App._attendanceCache = {};
 };
 
-// Load everything needed to calculate one subject's attendance (4 small reads)
+// Load everything needed to calculate one subject's attendance (4 small reads).
+// A student may only read their own copy, so for them the same picture is
+// built from it (see App.StudentViews).
 App.loadSubjectData = async function (subjectId) {
   const sid = String(subjectId);
+  const user = Auth.currentUser() || {};
+  if (user.role === "Student") return App._loadOwnSubjectData(sid, String(user.studentDocId));
+
   const [attDocs, dayStatuses, cancelDocs, allCorrections, leaveDocs] = await Promise.all([
     App.getAttendanceDocsForSubject(sid),
     App.getDayStatuses(),
@@ -751,8 +863,27 @@ App.loadSubjectData = async function (subjectId) {
   ]);
   const byDate = {}, markedByDate = {};
   Object.keys(attDocs).forEach(d => { byDate[d] = attDocs[d].records; markedByDate[d] = attDocs[d].markedBy; });
+  return App._subjectModel(sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveDocs.map(x => x.data));
+};
+
+App._loadOwnSubjectData = async function (sid, me) {
+  const [views, dayStatuses, cancelDocs] = await Promise.all([
+    App.StudentViews.mine(),
+    App.getDayStatuses(),
+    App._getDocsByIdPrefix("classCancellations", sid + "_")
+  ]);
+  const v = views[sid] || {};
+  const byDate = {};
+  Object.entries(v.days || {}).forEach(([date, status]) => { byDate[date] = { [me]: status }; });
+  const corrections = Object.entries(v.corrections || {}).map(([date, correctedStatus]) =>
+    ({ subjectId: sid, date, studentId: me, correctedStatus, decision: "Approved", timestamp: 0 }));
+  const leaves = Object.entries(v.leaves || {}).map(([date, type]) => ({ date, studentId: me, type }));
+  return App._subjectModel(sid, byDate, {}, dayStatuses, cancelDocs, corrections, leaves);
+};
+
+App._subjectModel = function (sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList) {
   const leaves = {};
-  leaveDocs.forEach(x => { leaves[x.data.date + "|" + String(x.data.studentId)] = x.data; });
+  leaveList.forEach(l => { leaves[l.date + "|" + String(l.studentId)] = l; });
 
   const cancelled = {};
   cancelDocs.forEach(d => {
@@ -1565,8 +1696,11 @@ App.LeaveRegister.render = async function () {
     out.querySelectorAll("button[data-leave-id]").forEach(b => {
       b.onclick = async () => {
         if (!await UI.confirm("Remove this leave? The day will count as Absent again.", { title: "Remove leave?", okText: "Remove", danger: true })) return;
+        const leave = list.find(l => l.id === b.getAttribute("data-leave-id"));
         try {
-          await db.collection("leaves").doc(b.getAttribute("data-leave-id")).delete();
+          await db.collection("leaves").doc(leave.id).delete();
+          await App.StudentViews.removeLeave(leave.studentId, leave.subjectId, leave.date)
+            .catch(e => console.warn("Student copy of leave not removed", e));
         } catch (e) {
           console.error(e);
           await UI.alert("Could not remove the leave. Check your internet connection and try again.");
@@ -4007,10 +4141,12 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
 
     saveBtn.disabled = true;
     const saved = await App.saveAttendanceToFirestore(attendanceRecord);
-    if (!saved) {
+    if (!saved.ok) {
       saveStatus.textContent = "NOT saved.";
       UI.alert("Attendance was NOT saved.\n\nCheck your internet connection and try again. " +
-            "(If attendance for this class and date was already saved, it cannot be saved again — use Request Correction.)");
+            "(If attendance for this class and date was already saved, it cannot be saved again — use Request Correction.)\n\n" +
+            "Attendance also can't be saved for a Sunday, a day the HOD closed, a class marked not held, " +
+            "a future date, or a semester that is not active.");
       await loadStudents();
       return;
     }
@@ -4035,7 +4171,8 @@ if (user && user.role === "Teacher" && !(await App.getClassCancellation(subjectI
     saveStatus.textContent = "Attendance saved.";
     const countText = document.getElementById("attendanceCountBox").textContent;
     await UI.alert("Attendance saved successfully.\n" + countText +
-      (leaveProblems.length ? `\n\n⚠️ ${leaveProblems.length} leave(s) could not be saved — those students show as Absent. Use "Mark Leave" to add them.` : ""));
+      (leaveProblems.length ? `\n\n⚠️ ${leaveProblems.length} leave(s) could not be saved — those students show as Absent. Use "Mark Leave" to add them.` : "") +
+      (saved.copiesMissing ? `\n\n⚠️ ${saved.copiesMissing} student(s) won't see this day on their dashboard yet. Ask the HOD to use "Rebuild student copies" (Admin Panel → Settings).` : ""));
     saveBtn.disabled = true;
     await loadStudents();   
   }
@@ -5251,6 +5388,7 @@ if (id !== "archiveSection") {
     renderClosedDays();
     App.Accounts.loadStudentLoginBatches();
     App.Settings.load();
+    App.StudentViews.initRebuildButton();
   }
   if (id === "hodDashboardSection") App.HodDash.init();
 
@@ -5388,6 +5526,9 @@ const req = doc.data();
    } catch (e) {
   console.warn("Firestore correction save failed", e);
   }
+  // The student sees the correction through their own copy
+  await App.StudentViews.setCorrection(req.studentId, req.subjectId, req.date, req.requestedStatus)
+    .catch(e => console.warn("Student copy of correction not saved", e));
 
   req.status = "approved";
   req.reviewedBy = user.username || "HOD";
