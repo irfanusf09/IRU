@@ -8,14 +8,20 @@ rules_version = '2';
 //              teachers, accounts, closures; approves corrections.
 //              Cannot create or change attendance records.
 //   Teacher  : reads class data; marks attendance ONCE per class per day,
-//              only for subjects assigned to them; requests corrections;
-//              marks own classes as not held.
-//   Student  : reads only their own student record, plus class-level data
-//              (attendance, subjects) needed for their dashboard.
+//              only for subjects assigned to them, and only on a day the
+//              class could have met (not Sunday, a closed day, a class
+//              marked not held, a future date, or a semester that is not
+//              ACTIVE); requests corrections; marks own classes as not held.
+//   Student  : reads only their own student record and their own
+//              attendance copies (studentViews), plus class-level data
+//              (subjects, closed days, classes not held). Never other
+//              students' attendance, leaves or corrections.
 //   Anyone not logged in: can only look up a login ID (to sign in).
 //
 // Saved attendance can never be edited or deleted through the app.
 // Changes go through correction requests approved by the HOD.
+//
+// Dates are the college's local (India, UTC+5:30) calendar dates.
 // =====================================================================
 
 service cloud.firestore {
@@ -44,6 +50,44 @@ service cloud.firestore {
         && get(assignmentPath(subjectId)).data.teacherId == me().teacherId;
     }
     function hodSetupDone() { return exists(/databases/$(database)/documents/config/hod); }
+    function doc(collection, id) { return /databases/$(database)/documents/$(collection)/$(id); }
+
+    // Could this class have met on this date? ("YYYY-MM-DD", already format-checked)
+    function classCouldMeet(subjectId, date) {
+      let day = timestamp.date(int(date[0:4]), int(date[5:7]), int(date[8:10]));
+      let subject = get(doc("subjects", subjectId)).data;
+      return day.dayOfWeek() != 7                                      // not a Sunday
+        && day <= request.time + duration.value(330, "m")              // not in the future (India time)
+        && !exists(doc("dayStatuses", date))                         // HOD has not closed the day
+        && !exists(doc("classCancellations", subjectId + "_" + date)) // not marked "not held"
+        && get(doc("batches", string(subject.batchId) + "_" + string(subject.semester))).data.status == "ACTIVE";
+    }
+
+    // A teacher's write to one student's attendance copy may add or change
+    // exactly one date (field "last"), and only to match the saved record:
+    //   days[last]   == that day's attendance for this student
+    //   leaves[last] == the type of that day's leave for this student
+    // Corrections are written by the HOD only.
+    function teacherViewWriteOk(viewId, oldDays, oldLeaves, oldCorrections) {
+      let v = request.resource.data;
+      let days = v.get("days", {});
+      let leaves = v.get("leaves", {});
+      let last = v.get("last", "");
+      let dayChanged = days.diff(oldDays).affectedKeys();
+      let leaveChanged = leaves.diff(oldLeaves).affectedKeys();
+      return teaches(v.subjectId)
+        && v.studentId is string
+        && last is string
+        && viewId == v.studentId + "_" + v.subjectId
+        && v.keys().hasOnly(["studentId", "subjectId", "days", "leaves", "corrections", "last"])
+        && v.get("corrections", {}) == oldCorrections
+        && dayChanged.hasOnly([last])
+        && leaveChanged.hasOnly([last])
+        && (dayChanged.size() == 0
+            || days[last] == getAfter(doc("attendance", v.subjectId + "_" + last)).data.records[v.studentId])
+        && (leaveChanged.size() == 0
+            || leaves[last] == get(doc("leaves", v.subjectId + "_" + last + "_" + v.studentId)).data.type);
+    }
 
     // ---------- One-time HOD setup ----------
     // The very first account to complete setup becomes HOD. Afterwards
@@ -125,13 +169,30 @@ service cloud.firestore {
 
     // ---------- Attendance (create once, never edit) ----------
     match /attendance/{docId} {
-      allow read: if anyUser();
+      allow read: if isStaff();
       allow create: if teaches(request.resource.data.subjectId)
         && request.resource.data.date is string
         && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
         && docId == request.resource.data.subjectId + "_" + request.resource.data.date
-        && request.resource.data.records is map;
+        && request.resource.data.records is map
+        && classCouldMeet(request.resource.data.subjectId, request.resource.data.date);
       allow update, delete: if false;
+    }
+
+    // ---------- Each student's own copy of their attendance ----------
+    // One document per student per subject: "<studentId>_<subjectId>"
+    //   { studentId, subjectId, days: {date: "Present"|"Absent"},
+    //     leaves: {date: leaveType}, corrections: {date: correctedStatus}, last }
+    // Written with the attendance itself (teacher), on approval (HOD), or
+    // rebuilt from the originals by the HOD. Students read only their own.
+    match /studentViews/{viewId} {
+      allow read: if isStaff() || (isStudent() && resource.data.studentId == me().studentDocId);
+      allow create: if isHod() || teacherViewWriteOk(viewId, {}, {}, {});
+      allow update: if isHod() || teacherViewWriteOk(viewId,
+                         resource.data.get("days", {}),
+                         resource.data.get("leaves", {}),
+                         resource.data.get("corrections", {}));
+      allow delete: if isHod();
     }
 
     match /classCancellations/{docId} {
@@ -154,7 +215,7 @@ service cloud.firestore {
       allow delete: if false;
     }
     match /attendanceCorrections/{id} {
-      allow read: if anyUser();
+      allow read: if isStaff();
       allow create: if isHod();
       allow update, delete: if false;
     }
@@ -163,7 +224,7 @@ service cloud.firestore {
     // A teacher records leave for a student who has an entry in that day's saved
     // attendance of a subject they teach. Leaves are never edited; only the HOD removes one.
     match /leaves/{docId} {
-      allow read: if anyUser();
+      allow read: if isStaff();
       allow create: if teaches(request.resource.data.subjectId)
         && request.resource.data.keys().hasOnly(["subjectId", "date", "studentId", "type", "reference", "markedBy", "markedAt"])
         && request.resource.data.type in ["CASUAL", "MEDICAL", "NCC", "OTHER"]

@@ -152,6 +152,16 @@
           await expectBlocked("Read teachers", () => db.collection("teachers").get());
           await expectBlocked("Read accounts", () => db.collection("users").get());
           await expectBlocked("Read correction requests", () => db.collection("correctionRequests").get());
+          await expectAllowed("Read own attendance", () =>
+            db.collection("studentViews").where("studentId", "==", String(me.profile.studentDocId)).get());
+          await expectBlocked("Read another student's attendance", () =>
+            db.collection("studentViews").where("studentId", "==", PROBE).get());
+          await expectBlocked("Read the class attendance registers", () => db.collection("attendance").get());
+          await expectBlocked("Read everyone's leaves", () => db.collection("leaves").get());
+          await expectBlocked("Read everyone's corrections", () => db.collection("attendanceCorrections").get());
+          await expectBlocked("Change own attendance", () => db.collection("studentViews")
+                              .doc(`${me.profile.studentDocId}_${PROBE}`).set({ studentId: String(me.profile.studentDocId), subjectId: PROBE, days: {} }),
+                              () => db.collection("studentViews").doc(`${me.profile.studentDocId}_${PROBE}`).delete());
           await expectBlocked("Make themselves HOD", () => db.collection("users").doc(me.uid).update({ role: "HOD" }),
                               () => db.collection("users").doc(me.uid).update({ role: "Student" }));
           await expectBlocked("Mark attendance", () => db.collection("attendance").doc(PROBE + "_2000-01-01")
