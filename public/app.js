@@ -75,7 +75,7 @@ function hideExpiryWarning() {
 
 // ---------- Login IDs & passwords ----------
 Auth.normalizeLoginId = v => String(v || "").trim().toLowerCase().replace(/\s+/g, "-");
-Auth.isValidLoginId = id => /^[a-z0-9][a-z0-9._-]{0,40}[a-z0-9]$/.test(id);
+Auth.isValidLoginId = id => /^[a-z0-9]([a-z0-9._-]{0,40}[a-z0-9])?$/.test(id);
 Auth.makeEmail = function (loginId) {
   const local = loginId.replace(/[^a-z0-9._-]/g, "").replace(/\.+/g, ".").replace(/^\.|\.$/g, "") || "user";
   return `${local}.${Math.random().toString(36).slice(2, 8)}@${ACCOUNT_EMAIL_DOMAIN}`;
@@ -107,7 +107,8 @@ Auth.logout = function () {
 };
 
 Auth.profileToSessionUser = function (uid, p) {
-  const base = { uid, role: p.role, name: p.name || "", loginId: p.loginId || "" };
+  const base = { uid, role: p.role, name: p.name || "", loginId: p.loginId || "", departmentId: p.departmentId || "" };
+  if (p.role === "Admin" || p.role === "Principal") return { ...base, username: p.loginId };
   if (p.role === "HOD") return { ...base, username: p.loginId };
   if (p.role === "Teacher") return { ...base, id: String(p.teacherId), username: p.loginId };
   if (p.role === "Student") return { ...base, studentId: p.studentId, studentDocId: String(p.studentDocId), roll: p.roll || "" };
@@ -177,29 +178,33 @@ Auth.changePassword = async function (currentPassword, newPassword) {
   Auth._lastPassword = null;
 };
 
-// ---------- One-time HOD setup ----------
-Auth.isSetupDone = async function () {
+// ---------- One-time setup ----------
+// "new": nothing set up yet; "legacy": an old single-department install (it has
+// an HOD but no Institution Admin yet); "done".
+Auth.setupState = async function () {
   try {
-    return (await db.collection("config").doc("hod").get()).exists;
+    if ((await db.collection("config").doc("institution").get()).exists) return "done";
+    return (await db.collection("config").doc("hod").get()).exists ? "legacy" : "new";
   } catch (e) {
     console.warn(e);
-    return true;   // if unsure, don't offer setup
+    return "done";   // if unsure, don't offer setup
   }
 };
 
-Auth.setupHod = async function (loginIdRaw, name, password) {
+// New install: the person setting up becomes the Institution Admin.
+Auth.setupInstitution = async function ({ institutionName, name, loginIdRaw, password }) {
   const loginId = Auth.normalizeLoginId(loginIdRaw);
-  if (await Auth.isSetupDone()) throw new Error("Setup has already been completed. Please log in.");
+  if ((await Auth.setupState()) !== "new") throw new Error("Setup has already been completed. Please log in.");
   const email = Auth.makeEmail(loginId);
   const cred = await auth.createUserWithEmailAndPassword(email, password);
   const uid = cred.user.uid;
   const now = new Date().toISOString();
-  const profile = { role: "HOD", name, loginId, active: true, mustChangePassword: false, createdAt: now };
+  const profile = { role: "Admin", name, loginId, active: true, mustChangePassword: false, createdAt: now };
   try {
     const batch = db.batch();
     batch.set(db.collection("users").doc(uid), profile);
-    batch.set(db.collection("config").doc("hod"), { uid, createdAt: now });
-    batch.set(db.collection("loginNames").doc(loginId), { email, uid });
+    batch.set(db.collection("loginNames").doc(loginId), { email, uid, departmentId: "" });
+    batch.set(db.collection("config").doc("institution"), { adminUid: uid, name: institutionName, createdAt: now });
     await batch.commit();
   } catch (e) {
     await auth.signOut().catch(() => {});
@@ -208,38 +213,117 @@ Auth.setupHod = async function (loginIdRaw, name, password) {
   localStorage.setItem("currentUser", JSON.stringify(Auth.profileToSessionUser(uid, profile)));
 };
 
+// Old single-department install: its HOD creates the Institution Admin's login
+// (a separate account). The Admin then moves the old records into a department.
+Auth.appointInstitutionAdmin = async function ({ institutionName, name, loginIdRaw, password }) {
+  const loginId = Auth.normalizeLoginId(loginIdRaw);
+  if ((await Auth.setupState()) !== "legacy") throw new Error("This has already been done.");
+  if (await App.Accounts.loginIdOwner(loginId)) throw new Error(`Login ID "${loginId}" is already used.`);
+  const creator = await App.Accounts._creatorAuth();
+  const email = Auth.makeEmail(loginId);
+  const cred = await creator.createUserWithEmailAndPassword(email, password);
+  const uid = cred.user.uid;
+  await creator.signOut().catch(() => {});
+  const now = new Date().toISOString();
+  const batch = db.batch();
+  batch.set(db.collection("users").doc(uid), { role: "Admin", name, loginId, active: true, mustChangePassword: true, createdAt: now });
+  batch.set(db.collection("loginNames").doc(loginId), { email, uid, departmentId: "" });
+  batch.set(db.collection("config").doc("institution"), { adminUid: uid, name: institutionName, createdAt: now });
+  await batch.commit();
+};
+
 const App = {};
+
+// ==========================
+// Departments
+//   Every record carries departmentId: the department that owns it (for a
+//   subject's records, the department offering the subject). HODs and
+//   teachers work inside their own department; the Institution Admin and
+//   the Principal see all departments. The database rules enforce this;
+//   these helpers make each screen read only what it may and needs.
+// ==========================
+App.role = () => (Auth.currentUser() || {}).role || "";
+App.dept = () => String((Auth.currentUser() || {}).departmentId || "");
+App.seesAll = () => App.role() === "Admin" || App.role() === "Principal";
+
+// A collection limited to one department (default: the user's own;
+// everything for Admin/Principal unless a department is given)
+App.scoped = function (collection, deptId) {
+  const q = db.collection(collection);
+  if (deptId) return q.where("departmentId", "==", String(deptId));
+  return App.seesAll() ? q : q.where("departmentId", "==", App.dept());
+};
+App._docs = async function (query) {
+  const out = [];
+  (await query.get()).forEach(d => out.push(d.data()));
+  return out;
+};
+
+// { departmentId: { id, name, programs } }, cached for a minute
+App.getDepartments = async function () {
+  const now = Date.now();
+  if (App._deptCache && now - App._deptCache.at < 60000) return App._deptCache.map;
+  const map = {};
+  (await db.collection("departments").get()).forEach(d => { map[d.id] = { id: d.id, ...d.data() }; });
+  App._deptCache = { at: now, map };
+  return map;
+};
+App.departmentName = async function (id) {
+  return ((await App.getDepartments())[id || App.dept()] || {}).name || "";
+};
+App.institutionName = async function () {
+  if (App._instName === undefined) {
+    try { App._instName = ((await db.collection("config").doc("institution").get()).data() || {}).name || ""; }
+    catch (e) { App._instName = ""; }
+  }
+  return App._instName;
+};
+
+// A student's own subjects (from any department) and their batches.
+// Students may not list everything, and with thousands of students it
+// would be costly, so only their enrollments are read.
+App._studentData = async function () {
+  const now = Date.now();
+  if (App._stuCache && now - App._stuCache.at < 20000) return App._stuCache;
+  const user = Auth.currentUser() || {};
+  const keys = [...new Set([Number(user.studentId), String(user.studentId)])].filter(k => k === k && k !== "undefined");
+  const enrollments = {};
+  if (keys.length) {
+    (await db.collection("enrollments").where("students", "array-contains-any", keys).get())
+      .forEach(d => { enrollments[d.id] = d.data().students || []; });
+  }
+  const subjects = (await Promise.all(Object.keys(enrollments).map(id => db.collection("subjects").doc(id).get())))
+    .filter(s => s.exists).map(s => s.data());
+  const batchIds = [...new Set(subjects.map(s => `${s.batchId}_${s.semester}`))];
+  const batches = (await Promise.all(batchIds.map(id => db.collection("batches").doc(id).get())))
+    .filter(b => b.exists).map(b => b.data());
+  App._stuCache = { at: now, enrollments, subjects, batches };
+  return App._stuCache;
+};
+
 App.getTeachersFromFirestore = async function () {
   try {
-    const snapshot = await db.collection("teachers").get();
-
-    const teachers = [];
-
-    snapshot.forEach(doc => {
-      teachers.push(doc.data());
-    });
-
-    console.log("Loaded teachers from Firestore:", teachers);
-
-    return teachers;
-
+    return await App._docs(App.scoped("teachers"));
   } catch (e) {
-    console.warn("Firestore unavailable, using LocalStorage");
+    console.warn("Teacher read failed", e);
     return [];
   }
 };
-// Saves the class's attendance together with each student's own copy (studentViews).
+// Saves the class's attendance together with each student's own copy (studentViews)
+// and the class summary for the Principal's dashboard (classSummaries).
 // Returns { ok, copiesMissing } — copiesMissing > 0 means the attendance is saved
 // but some students won't see this day until the HOD runs "Rebuild".
-App.saveAttendanceToFirestore = async function (record) {
+App.saveAttendanceToFirestore = async function (record, summary) {
   const ref = db.collection("attendance").doc(`${record.subjectId}_${record.date}`);
+  const summaryRef = db.collection("classSummaries").doc(`${record.subjectId}_${record.date}`);
   const copies = Object.keys(record.records).map(studentId =>
     App.StudentViews.dayWrite(studentId, record.subjectId, record.date, record.records[studentId]));
+  if (summary) copies.push({ ref: summaryRef, data: summary, whole: true });
 
   try {
     const batch = db.batch();
     batch.set(ref, record);
-    copies.forEach(c => batch.set(c.ref, c.data, { merge: true }));
+    copies.forEach(c => c.whole ? batch.set(c.ref, c.data) : batch.set(c.ref, c.data, { merge: true }));
     await batch.commit();
     return { ok: true, copiesMissing: 0 };
   } catch (e) {
@@ -254,7 +338,7 @@ App.saveAttendanceToFirestore = async function (record) {
     console.warn("Firestore save failed", e);
     return { ok: false };
   }
-  const results = await Promise.allSettled(copies.map(c => c.ref.set(c.data, { merge: true })));
+  const results = await Promise.allSettled(copies.map(c => c.whole ? c.ref.set(c.data) : c.ref.set(c.data, { merge: true })));
   return { ok: true, copiesMissing: results.filter(r => r.status === "rejected").length };
 };
 App.addTeacherToFirestore = async function(teacher) {
@@ -265,6 +349,7 @@ App.addTeacherToFirestore = async function(teacher) {
       id: String(docRef.id),          // 🔑 CRITICAL
       name: teacher.name,
       username: Auth.normalizeLoginId(teacher.username),
+      departmentId: App.dept(),
       status: "ACTIVE"                // passwords are NOT stored here (Firebase Auth keeps them)
     };
 
@@ -400,7 +485,8 @@ App.saveEnrollmentsToFirestore = async function(subjectId, studentIds) {
 
     await db.collection("enrollments").doc(docId).set({
       subjectId: subjectId,
-      students: studentIds
+      students: studentIds,
+      departmentId: App.dept()
     });
 
     console.log("Enrollments saved:", subjectId);
@@ -442,6 +528,7 @@ App.saveSubjectAssignmentToFirestore = async function(subjectId, teacherId) {
     await ref.set({
       subjectId: String(subjectId),
       teacherId: String(teacherId),
+      departmentId: App.dept(),
       timestamp: new Date().toISOString(),
       history
     });
@@ -456,7 +543,7 @@ App.saveSubjectAssignmentToFirestore = async function(subjectId, teacherId) {
 // Load all assignments
 App.getSubjectAssignmentsFromFirestore = async function() {
   try {
-    const snapshot = await db.collection("subjectAssignments").get();
+    const snapshot = await App.scoped("subjectAssignments").get();
     const map = {};
 
     snapshot.forEach(doc => {
@@ -476,34 +563,28 @@ App.getSubjectAssignmentsFromFirestore = async function() {
 // Firestore Day Status Helpers
 // ==========================
 
-// Save a closed day
-App.saveDayStatusToFirestore = async function(date, obj) {
+// Closed days, keyed by date: the whole institution's ("ALL") and one
+// department's. Doc IDs: "<date>" (institution) or "<departmentId>_<date>".
+App.getDayStatuses = async function (deptId) {
+  const d = String(deptId || App.dept() || "");
+  App._dayCache = App._dayCache || {};
+  const now = Date.now();
+  if (App._dayCache[d] && now - App._dayCache[d].at < 20000) return App._dayCache[d].map;
+  const q = d ? db.collection("dayStatuses").where("departmentId", "in", ["ALL", d])
+              : db.collection("dayStatuses").where("departmentId", "==", "ALL");
+  const map = {};
   try {
-    await db.collection("dayStatuses").doc(date).set(obj);
-    console.log("Day status saved:", date);
-    return true;
-  } catch (e) {
-    console.error("Day status save failed:", e);
-    return false;
-  }
-};
-
-// Get all closed days
-App.getDayStatusesFromFirestore = async function() {
-  try {
-    const snapshot = await db.collection("dayStatuses").get();
-    const map = {};
-
-    snapshot.forEach(doc => {
-      map[doc.id] = doc.data();
+    (await q.get()).forEach(doc => {
+      const x = doc.data();
+      const date = x.date || doc.id;
+      // a department closure is shown in preference to the institution's on the same day
+      if (!map[date] || x.departmentId !== "ALL") map[date] = { ...x, docId: doc.id };
     });
-
-    return map;
-
   } catch (e) {
-    console.warn("Firestore unavailable, using local dayStatuses");
-    return {};
+    console.warn("Closed days read failed", e);
   }
+  App._dayCache[d] = { at: now, map };
+  return map;
 };
 
 // ==========================
@@ -516,7 +597,7 @@ App.getDayStatusesFromFirestore = async function() {
 
 App.getAttendanceIndex = async function () {
   try {
-    const snapshot = await db.collection("attendance").get();
+    const snapshot = await App.scoped("attendance").get();
 
     const index = {};
 
@@ -547,22 +628,25 @@ App.getAttendanceIndex = async function () {
 // Phase 1 helpers (Firestore only)
 // ==========================
 
-// All attendance for ONE subject: { "YYYY-MM-DD": { studentId: "Present"/"Absent" } }
-// Uses the document ID prefix "<subjectId>_" so it works whether subjectId was
-// saved as a number or a string.
+// The department offering a subject (staff only ever handle their own department's)
+App.subjectDept = async function (subjectId) {
+  if (!App.seesAll()) return App.dept();
+  const s = await db.collection("subjects").doc(String(subjectId)).get();
+  return s.exists ? String(s.data().departmentId || "") : "";
+};
+
 // Full attendance documents for one subject: { "YYYY-MM-DD": { records, markedBy } }
 App.getAttendanceDocsForSubject = async function (subjectId) {
-  const prefix = String(subjectId) + "_";
+  const sid = String(subjectId);
   const result = {};
   const snapshot = await db.collection("attendance")
-    .orderBy(firebase.firestore.FieldPath.documentId())
-    .startAt(prefix)
-    .endAt(prefix + "\uf8ff")
+    .where("subjectId", "==", sid)
+    .where("departmentId", "==", await App.subjectDept(sid))
     .get();
 
   snapshot.forEach(doc => {
     const data = doc.data();
-    const date = data.date || doc.id.slice(prefix.length);
+    const date = data.date || doc.id.slice(sid.length + 1);
     const normalized = {};
     Object.keys(data.records || {}).forEach(k => {
       normalized[String(k)] = data.records[k];
@@ -587,12 +671,12 @@ App.removeSubjectAssignmentFromFirestore = async function (subjectId) {
   if (!snap.exists) return;
   const history = App._historyOf(snap.data());
   history.forEach(h => { if (!h.to) h.to = App.todayLocal(); });
-  await ref.set({ subjectId: String(subjectId), teacherId: null, timestamp: new Date().toISOString(), history });
+  await ref.set({ subjectId: String(subjectId), teacherId: null, departmentId: App.dept(), timestamp: new Date().toISOString(), history });
 };
 
 // { subjectId: [ {teacherId, from, to}, ... ] }
 App.getAssignmentHistories = async function () {
-  const snapshot = await db.collection("subjectAssignments").get();
+  const snapshot = await App.scoped("subjectAssignments").get();
   const out = {};
   snapshot.forEach(doc => { out[String(doc.data().subjectId || doc.id)] = App._historyOf(doc.data()); });
   return out;
@@ -670,13 +754,14 @@ App.leaveDocId = (subjectId, date, studentId) => `${subjectId}_${date}_${student
 App.saveLeave = async function ({ subjectId, date, studentId, type, reference }) {
   const user = Auth.currentUser() || {};
   const data = {
-    subjectId: String(subjectId), date, studentId: String(studentId), type,
+    subjectId: String(subjectId), departmentId: App.dept(), date, studentId: String(studentId), type,
     reference: reference || "", markedBy: String(user.id || ""), markedAt: new Date().toISOString()
   };
   await db.collection("leaves").doc(App.leaveDocId(data.subjectId, date, data.studentId)).set(data);
   // The leave itself is saved; a missing copy is repaired by the HOD's "Rebuild"
   await App.StudentViews.ref(data.studentId, data.subjectId)
-    .set({ studentId: data.studentId, subjectId: data.subjectId, leaves: { [date]: type }, last: date }, { merge: true })
+    .set({ studentId: data.studentId, subjectId: data.subjectId, departmentId: data.departmentId,
+           leaves: { [date]: type }, last: date }, { merge: true })
     .catch(e => console.warn("Student copy of leave not saved", e));
 };
 
@@ -696,7 +781,7 @@ App.StudentViews.ref = (studentId, subjectId) =>
 
 App.StudentViews.dayWrite = (studentId, subjectId, date, status) => ({
   ref: App.StudentViews.ref(studentId, subjectId),
-  data: { studentId: String(studentId), subjectId: String(subjectId), days: { [date]: status }, last: date }
+  data: { studentId: String(studentId), subjectId: String(subjectId), departmentId: App.dept(), days: { [date]: status }, last: date }
 });
 
 // The logged-in student's copies, { subjectId: copy }, cached for 20 seconds
@@ -713,7 +798,8 @@ App.StudentViews.mine = async function () {
 
 App.StudentViews.setCorrection = function (studentId, subjectId, date, status) {
   return App.StudentViews.ref(studentId, subjectId)
-    .set({ studentId: String(studentId), subjectId: String(subjectId), corrections: { [date]: status } }, { merge: true });
+    .set({ studentId: String(studentId), subjectId: String(subjectId), departmentId: App.dept(),
+           corrections: { [date]: status } }, { merge: true });
 };
 
 App.StudentViews.removeLeave = function (studentId, subjectId, date) {
@@ -723,31 +809,49 @@ App.StudentViews.removeLeave = function (studentId, subjectId, date) {
 
 // HOD: recreate every copy from attendance, approved corrections and leaves
 App.StudentViews.rebuild = async function (onProgress) {
-  const read = async c => { const out = []; (await db.collection(c).get()).forEach(d => out.push(d.data())); return out; };
+  const read = c => App._docs(App.scoped(c));
   if (onProgress) onProgress("Reading attendance…");
   const [attendance, corrections, leaves] = await Promise.all([read("attendance"), read("attendanceCorrections"), read("leaves")]);
 
   const views = {};
-  const view = (studentId, subjectId) => {
+  const view = (studentId, subjectId, departmentId) => {
     const id = `${studentId}_${subjectId}`;
     return views[id] = views[id] ||
-      { studentId: String(studentId), subjectId: String(subjectId), days: {}, leaves: {}, corrections: {} };
+      { studentId: String(studentId), subjectId: String(subjectId), departmentId: String(departmentId || ""),
+        days: {}, leaves: {}, corrections: {} };
   };
   attendance.forEach(a => Object.entries(a.records || {}).forEach(([sid, status]) => {
-    view(sid, a.subjectId).days[a.date] = status;
+    view(sid, a.subjectId, a.departmentId).days[a.date] = status;
   }));
   // Same rule as the attendance engine: approved corrections only, latest wins
   corrections
     .filter(c => c.decision !== "Rejected" && App.normalizeStatus(c.correctedStatus))
     .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp))
-    .forEach(c => { view(c.studentId, c.subjectId).corrections[c.date] = c.correctedStatus; });
-  leaves.forEach(l => { view(l.studentId, l.subjectId).leaves[l.date] = l.type; });
+    .forEach(c => { view(c.studentId, c.subjectId, c.departmentId).corrections[c.date] = c.correctedStatus; });
+  leaves.forEach(l => { view(l.studentId, l.subjectId, l.departmentId).leaves[l.date] = l.type; });
 
   const writes = Object.entries(views).map(([id, data]) => ({ collection: "studentViews", id, data }));
-  if (onProgress) onProgress(`Saving ${writes.length} student copies…`);
+
+  // Class summaries for the Principal's dashboard
+  const [subjects, teachers] = await Promise.all([App.getSubjects(), App.getTeachersFromFirestore()]);
+  const onLeave = new Set(leaves.map(l => `${l.subjectId}_${l.date}_${l.studentId}`));
+  attendance.forEach(a => {
+    const recs = Object.entries(a.records || {});
+    const present = recs.filter(([, v]) => App.normalizeStatus(v) === "Present").length;
+    const leave = recs.filter(([sid, v]) => App.normalizeStatus(v) !== "Present" && onLeave.has(`${a.subjectId}_${a.date}_${sid}`)).length;
+    const sub = subjects.find(s => String(s.id) === String(a.subjectId));
+    const t = teachers.find(x => String(x.id) === String(a.markedBy));
+    writes.push({ collection: "classSummaries", id: `${a.subjectId}_${a.date}`, data: {
+      departmentId: String(a.departmentId || ""), subjectId: String(a.subjectId), date: a.date,
+      subjectName: sub ? sub.name : "", teacherId: String(a.markedBy || ""), teacherName: t ? t.name : "",
+      present, leave, absent: recs.length - present - leave, markedAt: a.markedAt || ""
+    } });
+  });
+
+  if (onProgress) onProgress(`Saving ${writes.length} student copies and class summaries…`);
   await App.commitWrites(writes);
   App._viewsCache = null;
-  return writes.length;
+  return Object.keys(views).length;
 };
 
 App.StudentViews.initRebuildButton = function () {
@@ -771,12 +875,31 @@ App.StudentViews.initRebuildButton = function () {
   };
 };
 
+// Leave records of one subject (optionally only one date)
+App.getLeavesFor = async function (subjectId, date) {
+  let q = db.collection("leaves")
+    .where("subjectId", "==", String(subjectId))
+    .where("departmentId", "==", await App.subjectDept(subjectId));
+  if (date) q = q.where("date", "==", date);
+  return await App._docs(q);
+};
+
 // All class cancellations, as a list
 App.getAllClassCancellations = async function () {
-  const snapshot = await db.collection("classCancellations").get();
+  const snapshot = await App.scoped("classCancellations").get();
   const list = [];
   snapshot.forEach(doc => list.push(doc.data()));
   return list;
+};
+
+// Change fields of many documents: [{ ref, data }]
+App.commitUpdates = async function (updates, onProgress) {
+  for (let i = 0; i < updates.length; i += 400) {
+    if (onProgress) onProgress(`Saving ${Math.min(i + 400, updates.length)} of ${updates.length}…`);
+    const batch = db.batch();
+    updates.slice(i, i + 400).forEach(u => batch.update(u.ref, u.data));
+    await batch.commit();
+  }
 };
 
 // Save many documents safely (Firestore allows max 500 writes per batch)
@@ -854,25 +977,28 @@ App.loadSubjectData = async function (subjectId) {
   const user = Auth.currentUser() || {};
   if (user.role === "Student") return App._loadOwnSubjectData(sid, String(user.studentDocId));
 
-  const [attDocs, dayStatuses, cancelDocs, allCorrections, leaveDocs] = await Promise.all([
+  const dept = await App.subjectDept(sid);
+  const [attDocs, dayStatuses, cancelDocs, allCorrections, leaveList] = await Promise.all([
     App.getAttendanceDocsForSubject(sid),
-    App.getDayStatuses(),
+    App.getDayStatuses(dept),
     App._getDocsByIdPrefix("classCancellations", sid + "_"),
     App._getCorrectionsCached(),
-    App._getDocsByIdPrefix("leaves", sid + "_")
+    App.getLeavesFor(sid)
   ]);
   const byDate = {}, markedByDate = {};
   Object.keys(attDocs).forEach(d => { byDate[d] = attDocs[d].records; markedByDate[d] = attDocs[d].markedBy; });
-  return App._subjectModel(sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveDocs.map(x => x.data));
+  return App._subjectModel(sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList);
 };
 
 App._loadOwnSubjectData = async function (sid, me) {
-  const [views, dayStatuses, cancelDocs] = await Promise.all([
-    App.StudentViews.mine(),
-    App.getDayStatuses(),
+  const views = await App.StudentViews.mine();
+  const v = views[sid] || {};
+  // closed days of the department offering the subject
+  const subject = (await App.getSubjects()).find(s => String(s.id) === sid) || {};
+  const [dayStatuses, cancelDocs] = await Promise.all([
+    App.getDayStatuses(v.departmentId || subject.departmentId || ""),
     App._getDocsByIdPrefix("classCancellations", sid + "_")
   ]);
-  const v = views[sid] || {};
   const byDate = {};
   Object.entries(v.days || {}).forEach(([date, status]) => { byDate[date] = { [me]: status }; });
   const corrections = Object.entries(v.corrections || {}).map(([date, correctedStatus]) =>
@@ -1037,6 +1163,23 @@ App.syncGroup = function (sub, allSubjects, batches) {
   return sameBatch.filter(s => s.type === sub.type);
 };
 
+// Students by roll number, from any department (roll numbers are unique in the institution)
+App.findStudentsByRoll = async function (rolls) {
+  const out = {};
+  const list = [...new Set(rolls.map(r => String(r).trim()).filter(Boolean))];
+  for (let i = 0; i < list.length; i += 30) {
+    (await db.collection("students").where("roll", "in", list.slice(i, i + 30)).get())
+      .forEach(d => { out[String(d.data().roll).trim()] = d.data(); });
+  }
+  return out;
+};
+
+// May an unknown roll number be added as a new student of this department?
+// Yes for its own students' subjects (Major/Core, and all PG); for subjects taken
+// by other departments' students (Minor, Multidisciplinary, Skill, Elective, Other)
+// the student's home department must add them first.
+App.isHomeSubject = (sub, batches) => App.programOf(sub, batches) === "PG" || ["MAJOR", "CORE"].includes(sub.type);
+
 // Subjects a newly added student should join: the group, from this semester onward
 App.syncTerritory = function (sub, allSubjects, batches) {
   const group = App.syncGroup(sub, allSubjects, batches)
@@ -1087,7 +1230,7 @@ App.Accounts.issueLogin = async function ({ loginId, password, profile, oldUid, 
   batch.set(db.collection("users").doc(uid), {
     ...profile, loginId, active: true, mustChangePassword: true, createdAt: new Date().toISOString()
   });
-  batch.set(db.collection("loginNames").doc(loginId), { email, uid });
+  batch.set(db.collection("loginNames").doc(loginId), { email, uid, departmentId: profile.departmentId || "" });
   if (oldUid && oldUid !== uid) batch.delete(db.collection("users").doc(oldUid));   // old password stops working
   if (owner) {
     const data = { ...owner.data, loginId, uid };
@@ -1132,7 +1275,7 @@ App.Accounts.teacherLoginDialog = async function (t) {
   try {
     await App.Accounts.issueLogin({
       loginId, password,
-      profile: { role: "Teacher", name: t.name, teacherId: String(t.id) },
+      profile: { role: "Teacher", name: t.name, teacherId: String(t.id), departmentId: t.departmentId || App.dept() },
       oldUid: t.uid,
       owner: { collection: "teachers", id: t.id, data: t }
     });
@@ -1148,6 +1291,8 @@ App.Accounts.teacherLoginDialog = async function (t) {
 // ---------- Students ----------
 App.Accounts.studentLoginId = function (st, batch) {
   const roll = String(st.roll || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  // Roll numbers are unique in the institution, so the roll number itself is the login ID
+  if (Auth.isValidLoginId(roll)) return roll;
   return Auth.normalizeLoginId(`${batch.program}${batch.year}-${roll}`);
 };
 
@@ -1182,7 +1327,7 @@ App.Accounts.renderStudentLogins = async function () {
   out.innerHTML = "<p>Loading…</p>";
   const batch = await App.Accounts._batchInfo(batchId);
   const students = (await App.getStudents())
-    .filter(s => String(s.batchId) === String(batchId))
+    .filter(s => App.isOwnStudent(s) && String(s.batchId) === String(batchId))
     .sort(App.sortByRoll);
   if (!students.length) { out.innerHTML = "<p>No students in this batch yet.</p>"; return; }
 
@@ -1214,7 +1359,7 @@ App.Accounts.createStudentLogins = async function () {
   if (!batchId) { UI.alert("Select a batch first"); return; }
   const batch = await App.Accounts._batchInfo(batchId);
   const pending = (await App.getStudents())
-    .filter(s => String(s.batchId) === String(batchId) && !s.uid && (!s.status || s.status === "ACTIVE"))
+    .filter(s => App.isOwnStudent(s) && String(s.batchId) === String(batchId) && !s.uid && (!s.status || s.status === "ACTIVE"))
     .sort(App.sortByRoll);
   if (!pending.length) { UI.alert("Every active student in this batch already has a login."); return; }
   if (!await UI.confirm(`Create logins for ${pending.length} student(s) of ${batch.program} Batch ${batch.year}?\n\n` +
@@ -1233,7 +1378,7 @@ App.Accounts.createStudentLogins = async function () {
       const password = Auth.generatePassword();
       await App.Accounts.issueLogin({
         loginId, password,
-        profile: { role: "Student", name: st.name, roll: String(st.roll), studentId: st.id, studentDocId: String(st.id) },
+        profile: { role: "Student", name: st.name, roll: String(st.roll), studentId: st.id, studentDocId: String(st.id), departmentId: st.departmentId || App.dept() },
         owner: { collection: "students", id: st.id, data: st }
       });
       created.push({ Roll: String(st.roll), Name: st.name, "Login ID": loginId, Password: password });
@@ -1258,7 +1403,7 @@ App.Accounts.resetStudent = async function (studentId) {
   try {
     await App.Accounts.issueLogin({
       loginId, password,
-      profile: { role: "Student", name: st.name, roll: String(st.roll), studentId: st.id, studentDocId: String(st.id) },
+      profile: { role: "Student", name: st.name, roll: String(st.roll), studentId: st.id, studentDocId: String(st.id), departmentId: st.departmentId || App.dept() },
       oldUid: st.uid,
       owner: { collection: "students", id: st.id, data: st }
     });
@@ -1599,7 +1744,7 @@ App.HodDash.renderToday = async function (today) {
   if (!box) return;
   box.innerHTML = "Loading…";
 
-  const closed = await App.isClosedDay(today);
+  const closed = await App.isClosedDay(today, App.dept());
   if (closed) {
     box.innerHTML = `<p style="margin:0;">🗓️ Today is closed (${App.esc(closed.reason || closed.type)}). No classes expected.</p>`;
     return;
@@ -1631,7 +1776,7 @@ App.HodDash.renderToday = async function (today) {
     if (attSnap.exists) {
       const recs = Object.values(attSnap.data().records || {});
       const p = recs.filter(v => App.normalizeStatus(v) === "Present").length;
-      const onLeave = (await App._getDocsByIdPrefix("leaves", `${s.id}_${today}_`)).length;
+      const onLeave = (await App.getLeavesFor(s.id, today)).length;
       const a = recs.filter(v => App.normalizeStatus(v) === "Absent").length - onLeave;
       state = "✅ Marked"; detail = `${p} present, ${a} absent` + (onLeave ? `, ${onLeave} on leave` : ""); order = 2;
     } else if (cancelSnap.exists) {
@@ -1670,7 +1815,7 @@ App.LeaveRegister.render = async function () {
   out.innerHTML = "<p>Loading…</p>";
   try {
     const [snap, students, subjects, teachers] = await Promise.all([
-      db.collection("leaves").get(), App.getStudents(), App.getSubjects(), App.getTeachersFromFirestore()
+      App.scoped("leaves").get(), App.getStudents(), App.getSubjects(), App.getTeachersFromFirestore()
     ]);
     const list = [];
     snap.forEach(doc => list.push({ id: doc.id, ...doc.data() }));
@@ -1719,8 +1864,11 @@ App.LeaveRegister.render = async function () {
 // ==========================
 App.Settings = {};
 App.Settings.load = async function () {
-  const input = document.getElementById("casualLeaveLimitInput");
-  if (input) input.value = await App.getLeaveLimit();
+  const value = await App.getLeaveLimit();
+  const input = document.getElementById("casualLeaveLimitInput");     // Institution Admin edits it
+  if (input) input.value = value;
+  const show = document.getElementById("casualLeaveLimitShow");       // HODs see it
+  if (show) show.textContent = value;
 };
 App.Settings.save = async function () {
   const input = document.getElementById("casualLeaveLimitInput");
@@ -1746,16 +1894,31 @@ App.Backup.fetchAll = async function (onProgress) {
   const out = {};
   for (const c of App.Backup.COLLECTIONS) {
     if (onProgress) onProgress(c);
-    const snap = await db.collection(c).get();
+    const q = c === "dayStatuses" && !App.seesAll()
+      ? db.collection(c).where("departmentId", "in", ["ALL", App.dept()])
+      : App.scoped(c);
+    const snap = await q.get();
     out[c] = {};
     snap.forEach(doc => { out[c][doc.id] = doc.data(); });
+  }
+  if (App.seesAll()) {
+    out.departments = {};
+    (await db.collection("departments").get()).forEach(doc => { out.departments[doc.id] = doc.data(); });
+  } else {
+    // names of other departments' students taking this department's subjects
+    const ids = [...new Set(Object.values(out.enrollments).flatMap(e => e.students || []).map(String))]
+      .filter(id => !out.students[id]);
+    out.otherDepartmentStudents = {};
+    (await App.getStudentsByIds(ids)).forEach(s => { out.otherDepartmentStudents[String(s.id)] = s; });
   }
   return out;
 };
 
 App.Backup._status = function (text, colour) {
-  const el = document.getElementById("backupStatus");
-  if (el) { el.textContent = text; el.style.color = colour || "#555"; }
+  ["backupStatus", "instBackupStatus"].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) { el.textContent = text; el.style.color = colour || "#555"; }
+  });
 };
 
 App.Backup.showLast = function () {
@@ -1804,7 +1967,8 @@ App.Backup.downloadExcel = async function () {
     const d = await App.Backup.fetchAll(c => App.Backup._status(`Reading ${c}…`));
     const V = c => Object.values(d[c] || {});
     const subj = id => d.subjects[String(id)] || {};
-    const stud = id => d.students[String(id)] || V("students").find(s => String(s.id) === String(id)) || {};
+    const stud = id => d.students[String(id)] || (d.otherDepartmentStudents || {})[String(id)] ||
+      V("students").find(s => String(s.id) === String(id)) || {};
     const teacherName = id => (d.teachers[String(id)] || {}).name || "";
     const batch = id => V("batches").find(b => String(b.id) === String(id)) || {};
     const byKeys = (...keys) => (a, b) => {
@@ -1886,6 +2050,472 @@ App.Backup.downloadExcel = async function () {
 })();
 
 // ==========================
+// Institution Setup (Institution Admin)
+// ==========================
+App.Institution = {};
+
+App.Institution._tabs = function () {
+  const bar = document.getElementById("instTabs");
+  if (!bar || bar.dataset.bound) return;
+  bar.dataset.bound = "1";
+  const show = tab => {
+    bar.querySelectorAll("button[data-tab]").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    document.querySelectorAll("#institutionSection .admin-tab").forEach(t => t.classList.toggle("active", t.dataset.tab === tab));
+    try { sessionStorage.setItem("instTab", tab); } catch (e) {}
+  };
+  bar.addEventListener("click", e => { const b = e.target.closest("button[data-tab]"); if (b) show(b.dataset.tab); });
+  let last = null;
+  try { last = sessionStorage.getItem("instTab"); } catch (e) {}
+  show(last || "departments");
+  App.Institution._showTab = show;
+};
+
+App.Institution.init = async function () {
+  App.Institution._tabs();
+  App.Closures.bind({
+    date: document.getElementById("instClosedDate"), type: document.getElementById("instClosedType"),
+    reason: document.getElementById("instClosedReason"), btn: document.getElementById("instClosedBtn"),
+    list: document.getElementById("instClosedList")
+  });
+  document.getElementById("addDeptBtn").onclick = App.Institution.addDepartment;
+  document.getElementById("addLeaderBtn").onclick = App.Institution.addLeader;
+  document.getElementById("leaderRole").onchange = e => {
+    document.getElementById("leaderDept").style.display = e.target.value === "HOD" ? "" : "none";
+  };
+  document.getElementById("instBackupExcelBtn").onclick = App.Backup.downloadExcel;
+  document.getElementById("instBackupJsonBtn").onclick = App.Backup.downloadJson;
+
+  const inst = (await db.collection("config").doc("institution").get()).data() || {};
+  document.getElementById("instName").textContent = inst.name || "";
+  App._deptCache = null;
+  App.Institution.renderDepartments();
+  App.Institution.renderLeaders();
+  App.Closures.render(document.getElementById("instClosedList"));
+  App.Settings.load();
+
+  // An old single-department install: its records still need a department
+  const legacy = !inst.migratedAt && (await db.collection("config").doc("hod").get()).exists;
+  document.getElementById("instUpgradeTab").style.display = legacy ? "" : "none";
+  if (legacy) {
+    App.Institution.renderUpgrade();
+    App.Institution._showTab("upgrade");
+  }
+};
+
+App.Institution._leaders = async function () {
+  const list = [];
+  (await db.collection("users").where("role", "in", ["HOD", "Principal", "Admin"]).get())
+    .forEach(d => list.push({ uid: d.id, ...d.data() }));
+  return list;
+};
+
+App.Institution.renderDepartments = async function () {
+  const out = document.getElementById("deptList");
+  const select = document.getElementById("leaderDept");
+  try {
+    const [depts, leaders] = await Promise.all([App.getDepartments(), App.Institution._leaders()]);
+    const list = Object.values(depts).sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    select.innerHTML = list.map(d => `<option value="${App.esc(d.id)}">${App.esc(d.name)}</option>`).join("");
+    if (!list.length) { out.innerHTML = "<p>No departments yet. Add the first one below.</p>"; return; }
+    out.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
+      <tr><th style="text-align:left;">Department</th><th>Programmes</th><th>HOD</th><th></th></tr>` +
+      list.map(d => {
+        const hods = leaders.filter(u => u.role === "HOD" && u.departmentId === d.id && u.active !== false).map(u => u.name);
+        return `<tr><td style="text-align:left;">${App.esc(d.name)}</td><td>${App.esc((d.programs || []).join(", "))}</td>
+          <td>${hods.length ? App.esc(hods.join(", ")) : "<i style='color:#b45309'>none yet</i>"}</td>
+          <td><button data-rename="${App.esc(d.id)}">Rename</button> <button data-programs="${App.esc(d.id)}">Programmes</button></td></tr>`;
+      }).join("") + "</table>";
+    out.querySelectorAll("button[data-rename]").forEach(b => b.onclick = async () => {
+      const d = depts[b.dataset.rename];
+      const name = await UI.prompt("New name for the department:", { defaultValue: d.name });
+      if (!name || !name.trim()) return;
+      await db.collection("departments").doc(d.id).update({ name: name.trim() });
+      App._deptCache = null;
+      App.Institution.renderDepartments();
+    });
+    out.querySelectorAll("button[data-programs]").forEach(b => b.onclick = async () => {
+      const d = depts[b.dataset.programs];
+      const text = await UI.prompt("Programmes this department runs (any of UG, PG, IG, separated by commas):",
+        { defaultValue: (d.programs || []).join(", ") });
+      if (text === null) return;
+      const programs = App.Institution._parsePrograms(text);
+      if (!programs.length) { UI.alert("Give at least one of UG, PG or IG."); return; }
+      await db.collection("departments").doc(d.id).update({ programs });
+      App._deptCache = null;
+      App.Institution.renderDepartments();
+    });
+  } catch (e) {
+    console.error(e);
+    out.innerHTML = "<p style='color:red;'>Could not load departments.</p>";
+  }
+};
+
+App.Institution._parsePrograms = text =>
+  ["UG", "PG", "IG"].filter(p => String(text).toUpperCase().split(/[^A-Z]+/).includes(p));
+
+App.Institution.addDepartment = async function () {
+  const input = document.getElementById("deptNameInput");
+  const name = input.value.trim().replace(/\s+/g, " ");
+  const programs = ["UG", "PG", "IG"].filter(p => document.getElementById("dept" + p).checked);
+  if (!name) { UI.alert("Enter the department's name."); return; }
+  if (!programs.length) { UI.alert("Tick at least one programme (UG, PG or IG)."); return; }
+  const depts = await App.getDepartments();
+  if (Object.values(depts).some(d => String(d.name).toLowerCase() === name.toLowerCase())) {
+    UI.alert(`"${name}" already exists.`); return;
+  }
+  // A short, permanent ID made from the name (records store it; renaming later is fine)
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "dept";
+  let id = base, n = 2;
+  while (depts[id] || (await db.collection("departments").doc(id).get()).exists) id = `${base}-${n++}`;
+  try {
+    await db.collection("departments").doc(id).set({ name, programs, createdAt: new Date().toISOString() });
+  } catch (e) {
+    console.error(e);
+    UI.alert(App.Accounts.errorText(e));
+    return;
+  }
+  input.value = "";
+  App._deptCache = null;
+  await App.Institution.renderDepartments();
+  const upgrading = document.getElementById("instUpgradeTab").style.display !== "none";
+  if (upgrading) await App.Institution.renderUpgrade();
+  await UI.alert(upgrading
+    ? `Department "${name}" added.\n\nNext: tab "Old records" — move the old records into it.`
+    : `Department "${name}" added.\n\nNext: create its HOD's login (tab "HOD & Principal logins").`);
+};
+
+App.Institution.renderLeaders = async function () {
+  const out = document.getElementById("leaderList");
+  try {
+    const [leaders, depts] = await Promise.all([App.Institution._leaders(), App.getDepartments()]);
+    const me = (Auth.currentUser() || {}).uid;
+    const order = { Admin: 0, Principal: 1, HOD: 2 };
+    leaders.sort((a, b) => order[a.role] - order[b.role] ||
+      String((depts[a.departmentId] || {}).name || "").localeCompare(String((depts[b.departmentId] || {}).name || "")));
+    out.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
+      <tr><th style="text-align:left;">Name</th><th>Role</th><th>Department</th><th>Login ID</th><th>Status</th><th></th></tr>` +
+      leaders.map(u => `<tr>
+        <td style="text-align:left;">${App.esc(u.name)}</td>
+        <td>${App.esc(u.role === "Admin" ? "Institution Admin" : u.role)}</td>
+        <td>${App.esc((depts[u.departmentId] || {}).name || (u.departmentId ? u.departmentId : "—"))}</td>
+        <td>${App.esc(u.loginId || "")}</td>
+        <td>${u.active === false ? "<span style='color:#b91c1c'>Deactivated</span>" : "Active"}</td>
+        <td>${u.uid === me ? "<i>you</i>" : `<button data-reset="${App.esc(u.uid)}">Reset password</button>
+             <button data-active="${App.esc(u.uid)}">${u.active === false ? "Reactivate" : "Deactivate"}</button>`}</td>
+      </tr>`).join("") + "</table>";
+    out.querySelectorAll("button[data-reset]").forEach(b => b.onclick = () =>
+      App.Institution.resetLeader(leaders.find(u => u.uid === b.dataset.reset)));
+    out.querySelectorAll("button[data-active]").forEach(b => b.onclick = async () => {
+      const u = leaders.find(x => x.uid === b.dataset.active);
+      const activate = u.active === false;
+      if (!await UI.confirm(`${activate ? "Reactivate" : "Deactivate"} ${u.name}'s login?`,
+        { okText: activate ? "Reactivate" : "Deactivate", danger: !activate })) return;
+      await App.Accounts.setActive(u.uid, activate);
+      App.Institution.renderLeaders();
+      App.Institution.renderDepartments();
+    });
+  } catch (e) {
+    console.error(e);
+    out.innerHTML = "<p style='color:red;'>Could not load logins.</p>";
+  }
+};
+
+App.Institution.addLeader = async function () {
+  const role = document.getElementById("leaderRole").value;
+  const departmentId = role === "HOD" ? document.getElementById("leaderDept").value : "";
+  const name = document.getElementById("leaderName").value.trim();
+  const loginId = Auth.normalizeLoginId(document.getElementById("leaderLoginId").value);
+  if (role === "HOD" && !departmentId) { UI.alert("Add the department first."); return; }
+  if (!name) { UI.alert("Enter the name."); return; }
+  if (!Auth.isValidLoginId(loginId)) { UI.alert("Login ID can use only letters, numbers, dots and dashes."); return; }
+  if (await App.Accounts.loginIdOwner(loginId)) { UI.alert(`Login ID "${loginId}" is already used.`); return; }
+  const password = Auth.generatePassword();
+  const btn = document.getElementById("addLeaderBtn");
+  btn.disabled = true;
+  try {
+    await App.Accounts.issueLogin({ loginId, password, profile: { role, name, departmentId } });
+    document.getElementById("leaderName").value = "";
+    document.getElementById("leaderLoginId").value = "";
+    await UI.alert(`Login ready for ${name} (${role}).\n\nLogin ID: ${loginId}\nStarting password: ${password}\n\n` +
+      `Give these to them. They will choose their own password at first login.`);
+  } catch (e) {
+    console.error(e);
+    UI.alert(App.Accounts.errorText(e));
+  } finally {
+    btn.disabled = false;
+  }
+  App.Institution.renderLeaders();
+  App.Institution.renderDepartments();
+};
+
+App.Institution.resetLeader = async function (u) {
+  if (!(await App.Recovery.confirmHodReset(u.uid, u.name))) return;
+  if (!await UI.confirm(`Give ${u.name} a NEW password? Their old password will stop working.`)) return;
+  const password = Auth.generatePassword();
+  try {
+    await App.Accounts.issueLogin({
+      loginId: u.loginId, password, oldUid: u.uid,
+      profile: { role: u.role, name: u.name, departmentId: u.departmentId || "" }
+    });
+    await UI.alert(`New password for ${u.name}\n\nLogin ID: ${u.loginId}\nPassword: ${password}\n\nThey will choose their own password at first login.`);
+  } catch (e) {
+    console.error(e);
+    UI.alert(App.Accounts.errorText(e));
+  }
+  App.Institution.renderLeaders();
+};
+
+// ---------- Records from before departments ----------
+App.Institution.renderUpgrade = async function () {
+  const out = document.getElementById("upgradeOldRecords");
+  const depts = Object.values(await App.getDepartments());
+  out.innerHTML = `<p>This app was used for a single department before departments existed. Its records
+      (students, subjects, attendance, logins …) must be placed in a department before anyone can use them again.</p>
+    ${depts.length ? "" : "<p><b>First add that department</b> in the Departments tab, then come back here.</p>"}
+    <label>Department: <select id="upgradeDept">${depts.map(d => `<option value="${App.esc(d.id)}">${App.esc(d.name)}</option>`).join("")}</select></label>
+    <button id="upgradeBtn" class="primary" ${depts.length ? "" : "disabled"}>Move old records into this department</button>
+    <p id="upgradeStatus" style="font-size:13px;"></p>`;
+  const btn = document.getElementById("upgradeBtn");
+  btn.onclick = async () => {
+    const deptId = document.getElementById("upgradeDept").value;
+    const deptName = (depts.find(d => d.id === deptId) || {}).name;
+    if (!await UI.confirm(`Move all old records into ${deptName}?\n\nThis is done once. Its HOD, teachers and students can then log in again.`)) return;
+    const status = document.getElementById("upgradeStatus");
+    btn.disabled = true;
+    status.style.color = "#555";
+    try {
+      const n = await App.Institution.migrateLegacy(deptId, t => { status.textContent = t; });
+      status.style.color = "green";
+      const many = (k, word) => `${k} ${word}${k === 1 ? "" : "s"}`;
+      status.textContent = `✅ Done: ${many(n.records, "record")}, ${many(n.accounts, "account")} and ${many(n.closedDays, "closed day")} moved into ${deptName}` +
+        (n.rollLogins ? `; ${n.rollLogins === 1 ? "1 student" : n.rollLogins + " students"} can now also log in with their roll number.` : ".");
+      document.getElementById("instUpgradeTab").style.display = "none";
+      btn.style.display = "none";
+      App.Institution.renderDepartments();
+    } catch (e) {
+      console.error(e);
+      status.style.color = "red";
+      status.textContent = "Not finished: " + App.Accounts.errorText(e) + " — you can press the button again; it continues where it stopped.";
+      btn.disabled = false;
+    }
+  };
+};
+
+// Tag every record without a department; turn old closed days into the
+// department's; give students their roll number as an extra login ID.
+App.Institution.migrateLegacy = async function (deptId, progress) {
+  const say = t => progress && progress(t);
+  const updates = [];
+  for (const c of ["batches", "subjects", "enrollments", "subjectAssignments", "teachers", "students", "attendance",
+                   "classCancellations", "correctionRequests", "attendanceCorrections", "leaves", "studentViews"]) {
+    say(`Reading ${c}…`);
+    (await db.collection(c).get()).forEach(d => {
+      if (!("departmentId" in d.data())) updates.push({ ref: d.ref, data: { departmentId: deptId } });
+    });
+  }
+  const records = updates.length;
+
+  say("Reading accounts…");
+  const users = [];
+  (await db.collection("users").get()).forEach(d => users.push({ uid: d.id, ...d.data() }));
+  const old = users.filter(u => ["HOD", "Teacher", "Student"].includes(u.role) && !u.departmentId);
+  const emails = {};
+  for (const u of old) {
+    updates.push({ ref: db.collection("users").doc(u.uid), data: { departmentId: deptId } });
+    if (!u.loginId) continue;
+    const ln = await db.collection("loginNames").doc(u.loginId).get();
+    if (ln.exists && ln.data().uid === u.uid) {
+      emails[u.uid] = ln.data().email;
+      if (!ln.data().departmentId) updates.push({ ref: ln.ref, data: { departmentId: deptId } });
+    }
+  }
+  await App.commitUpdates(updates, say);
+
+  say("Moving closed days…");
+  const days = [];
+  (await db.collection("dayStatuses").get()).forEach(d => { if (!("departmentId" in d.data())) days.push(d); });
+  for (let i = 0; i < days.length; i += 200) {
+    const batch = db.batch();
+    days.slice(i, i + 200).forEach(d => {
+      const date = d.data().date || d.id;
+      batch.set(db.collection("dayStatuses").doc(`${deptId}_${date}`), { ...d.data(), date, departmentId: deptId });
+      batch.delete(d.ref);
+    });
+    await batch.commit();
+  }
+
+  // Students also get their roll number as a login ID (their old ID keeps working)
+  say("Adding roll-number login IDs…");
+  let rollLogins = 0;
+  for (const u of old.filter(u => u.role === "Student" && u.roll && emails[u.uid])) {
+    const rollId = Auth.normalizeLoginId(u.roll);
+    if (rollId === u.loginId || !Auth.isValidLoginId(rollId) || await App.Accounts.loginIdOwner(rollId)) continue;
+    await db.collection("loginNames").doc(rollId).set({ email: emails[u.uid], uid: u.uid, departmentId: deptId });
+    rollLogins++;
+  }
+
+  await db.collection("config").doc("institution").update({ migratedAt: new Date().toISOString() });
+  return { records, accounts: old.length, closedDays: days.length, rollLogins };
+};
+
+// Shown to accounts from before departments (an old single-department install)
+App.Upgrade = {};
+App.Upgrade.init = async function () {
+  const out = document.getElementById("upgradeOutput");
+  const user = Auth.currentUser() || {};
+  const state = await Auth.setupState();
+  if (user.role !== "HOD" || state === "done") {
+    out.innerHTML = `<p>The app now supports several departments, and your department's records are being moved into the new
+      layout by the Institution Admin. Please try again later${user.role === "HOD" ? "" : ", or ask your HOD"}.</p>`;
+    return;
+  }
+  out.innerHTML = `<p>The app now supports several departments. Your records are kept and will be placed in your department.</p>
+    <p><b>Step 1 (now):</b> create the <b>Institution Admin</b> login. The Institution Admin adds departments, creates HOD and
+      Principal logins and sets institution-wide rules. It is a separate login from yours.</p>
+    <p><b>Step 2:</b> log in as the Institution Admin, add your department, and press <b>Move old records</b>.
+      Then you can log in as HOD again.</p>
+    <input id="upInstitution" placeholder="Institution name (e.g. Amar Singh College)" style="display:block; width:100%; max-width:420px; margin-bottom:8px;">
+    <input id="upName" placeholder="Institution Admin's name" style="display:block; width:100%; max-width:420px; margin-bottom:8px;">
+    <input id="upLoginId" value="admin" placeholder="Login ID (e.g. admin)" autocapitalize="none" style="display:block; width:100%; max-width:420px; margin-bottom:8px;">
+    <button id="upBtn" class="primary">Create Institution Admin login</button>
+    <p id="upMessage" style="font-size:13px;"></p>`;
+  document.getElementById("upBtn").onclick = async () => {
+    const msg = document.getElementById("upMessage");
+    const institutionName = document.getElementById("upInstitution").value.trim();
+    const name = document.getElementById("upName").value.trim();
+    const loginId = Auth.normalizeLoginId(document.getElementById("upLoginId").value);
+    msg.style.color = "red";
+    if (!institutionName || !name) { msg.textContent = "Enter the institution's name and the Admin's name."; return; }
+    if (!Auth.isValidLoginId(loginId)) { msg.textContent = "Login ID: letters, numbers, dots or dashes."; return; }
+    const password = Auth.generatePassword();
+    document.getElementById("upBtn").disabled = true;
+    try {
+      await Auth.appointInstitutionAdmin({ institutionName, name, loginIdRaw: loginId, password });
+      out.innerHTML = `<p style="color:green;"><b>✅ Institution Admin login created.</b></p>
+        <p>Login ID: <b>${App.esc(loginId)}</b><br>Starting password: <b>${App.esc(password)}</b></p>
+        <p>Write these down now. Next: log out, log in with them (you will be asked to choose a new password),
+          add your department in <b>Institution Setup</b>, and press <b>Move old records</b>.</p>`;
+    } catch (e) {
+      console.error(e);
+      msg.textContent = App.Accounts.errorText(e);
+      document.getElementById("upBtn").disabled = false;
+    }
+  };
+};
+
+// ==========================
+// Institution Dashboard (Principal, Institution Admin) — view only.
+// Reads the small per-class summaries of one day, not the attendance itself.
+// ==========================
+App.Principal = {};
+App.Principal.init = function () {
+  const dateEl = document.getElementById("principalDate");
+  if (!dateEl.value) dateEl.value = App.todayLocal();
+  dateEl.onchange = () => App.Principal.render();
+  document.getElementById("principalTodayBtn").onclick = () => { dateEl.value = App.todayLocal(); App.Principal.render(); };
+  App.Principal.render();
+};
+
+App.Principal.render = async function () {
+  const out = document.getElementById("principalOutput");
+  const date = document.getElementById("principalDate").value;
+  if (!date) return;
+  const my = App.Principal._seq = (App.Principal._seq || 0) + 1;   // only the latest date may draw
+  out.innerHTML = "<p>Loading…</p>";
+  try {
+    const [depts, sums, cancels, closures] = await Promise.all([
+      App.getDepartments(),
+      App._docs(db.collection("classSummaries").where("date", "==", date)),
+      App._docs(db.collection("classCancellations").where("date", "==", date)),
+      App._docs(db.collection("dayStatuses").where("date", "==", date))
+    ]);
+    if (my !== App.Principal._seq) return;
+    const pct = (p, a) => p + a ? Math.round(p * 100 / (p + a)) + "%" : "—";
+    const fmtTime = iso => iso ? new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    const total = sums.reduce((t, s) => ({ p: t.p + s.present, a: t.a + s.absent, l: t.l + s.leave }), { p: 0, a: 0, l: 0 });
+    const allClosed = closures.find(c => c.departmentId === "ALL");
+
+    let html = "";
+    if (App.isSundayDate(date)) html += `<p>🗓️ Sunday.</p>`;
+    if (allClosed) html += `<p>🗓️ <b>Closed for the whole institution:</b> ${App.esc(allClosed.reason || allClosed.type)}</p>`;
+    html += `<div class="stat-row">
+        <div class="stat"><b>${sums.length}</b><span>classes held</span></div>
+        <div class="stat"><b>${total.p}</b><span>present</span></div>
+        <div class="stat"><b>${total.a}</b><span>absent</span></div>
+        <div class="stat"><b>${total.l}</b><span>on leave</span></div>
+        <div class="stat"><b>${pct(total.p, total.a)}</b><span>attendance</span></div>
+      </div>
+      <p style="font-size:12px; color:#6b7280;">Counts are as marked in class (leave recorded later is included after the HOD's next "Rebuild").</p>`;
+
+    const rows = Object.values(depts).sort((a, b) => String(a.name).localeCompare(String(b.name))).map(d => {
+      const mine = sums.filter(s => s.departmentId === d.id).sort((a, b) => String(a.markedAt).localeCompare(String(b.markedAt)));
+      const t = mine.reduce((t, s) => ({ p: t.p + s.present, a: t.a + s.absent, l: t.l + s.leave }), { p: 0, a: 0, l: 0 });
+      const closed = closures.find(c => c.departmentId === d.id);
+      return { d, mine, t, closed, notHeld: cancels.filter(c => c.departmentId === d.id) };
+    });
+    html += `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
+      <tr><th style="text-align:left;">Department</th><th>Classes held</th><th>Not held</th><th>Present</th><th>Absent</th><th>Leave</th><th>%</th></tr>` +
+      rows.map(r => `<tr${r.mine.length ? "" : ' style="color:#6b7280;"'}>
+        <td style="text-align:left;">${App.esc(r.d.name)}${r.closed ? ` <small>(closed: ${App.esc(r.closed.reason || "")})</small>` : ""}</td>
+        <td>${r.mine.length}</td><td>${r.notHeld.length}</td><td>${r.t.p}</td><td>${r.t.a}</td><td>${r.t.l}</td><td>${pct(r.t.p, r.t.a)}</td></tr>`).join("") +
+      `</table>`;
+
+    // Which classes were taken, and by whom
+    html += `<h2 style="margin-top:22px;">Classes taken</h2>`;
+    const withClasses = rows.filter(r => r.mine.length || r.notHeld.length);
+    if (!withClasses.length) html += "<p>No classes recorded for this day.</p>";
+    withClasses.forEach(r => {
+      html += `<details class="dept-classes"><summary><b>${App.esc(r.d.name)}</b> — ${r.mine.length} held${r.notHeld.length ? `, ${r.notHeld.length} not held` : ""}</summary>
+        <table border="1" cellpadding="4" width="100%" style="border-collapse:collapse; margin-top:6px;">
+        <tr><th style="text-align:left;">Class</th><th>Teacher</th><th>Marked at</th><th>Present</th><th>Absent</th><th>Leave</th></tr>` +
+        r.mine.map(s => `<tr><td style="text-align:left;">${App.esc(s.subjectName)}</td><td>${App.esc(s.teacherName)}</td>
+          <td>${fmtTime(s.markedAt)}</td><td>${s.present}</td><td>${s.absent}</td><td>${s.leave}</td></tr>`).join("") +
+        r.notHeld.map(c => `<tr style="background:#fefce8;"><td style="text-align:left;" colspan="3">Class not held — ${App.esc(c.reason || "")}</td><td colspan="3"></td></tr>`).join("") +
+        `</table></details>`;
+    });
+
+    html += `<h2 style="margin-top:22px;">Not marked yet</h2>
+      <p style="font-size:12px; color:#6b7280;">Not every subject meets every day — use this as a reminder to check, not as a record.</p>
+      <button id="principalNotMarkedBtn">Check classes not marked</button>
+      <div id="principalNotMarked" style="margin-top:8px;"></div>`;
+    out.innerHTML = html;
+    document.getElementById("principalNotMarkedBtn").onclick = () => App.Principal.notMarked(date, depts, sums, cancels, closures);
+  } catch (e) {
+    console.error(e);
+    if (my === App.Principal._seq) out.innerHTML = "<p style='color:red;'>Could not load the dashboard. Check your internet connection.</p>";
+  }
+};
+
+// Active subjects (ACTIVE semester, with students) that have neither attendance nor "not held"
+App.Principal.notMarked = async function (date, depts, sums, cancels, closures) {
+  const box = document.getElementById("principalNotMarked");
+  box.innerHTML = "Checking…";
+  try {
+    const [subjects, batches, enrollments] = await Promise.all([App.getSubjects(), App.getBatches(), App.getEnrollments()]);
+    const done = new Set([...sums, ...cancels].map(x => String(x.subjectId)));
+    const closedDept = new Set(closures.map(c => c.departmentId));
+    const waiting = subjects.filter(s => {
+      const b = batches.find(b => String(b.id) === String(s.batchId) && String(b.semester) === String(s.semester));
+      return b && b.status === "ACTIVE" && (enrollments[String(s.id)] || []).length > 0 &&
+             !done.has(String(s.id)) && !closedDept.has("ALL") && !closedDept.has(s.departmentId);
+    });
+    if (App.isSundayDate(date) || closedDept.has("ALL")) { box.innerHTML = "<p>No classes expected on this day.</p>"; return; }
+    if (!waiting.length) { box.innerHTML = "<p>✅ Every active class is marked or recorded as not held.</p>"; return; }
+    const byDept = {};
+    waiting.forEach(s => (byDept[s.departmentId] = byDept[s.departmentId] || []).push(s));
+    box.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
+      <tr><th style="text-align:left;">Department</th><th>Not marked</th><th style="text-align:left;">Subjects</th></tr>` +
+      Object.entries(byDept).sort((a, b) => b[1].length - a[1].length).map(([id, list]) => `<tr>
+        <td style="text-align:left;">${App.esc((depts[id] || {}).name || id)}</td><td>${list.length}</td>
+        <td style="text-align:left; font-size:13px;">${list.map(s => App.esc(App.subjectLabel(s, batches))).join("<br>")}</td></tr>`).join("") +
+      `</table>`;
+  } catch (e) {
+    console.error(e);
+    box.innerHTML = "<p style='color:red;'>Could not check. Check your internet connection.</p>";
+  }
+};
+
+// ==========================
 // Course Templates (Economics)
 // ==========================
 
@@ -1913,62 +2543,64 @@ App.CourseTemplates = {
   ]
 };
 
+// The department's own students, plus students of other departments taking
+// its subjects (e.g. a Minor). Admin/Principal: everyone.
 App.getStudents = async function () {
   try {
-    const snapshot = await db.collection("students").get();
-
-    const students = [];
-    snapshot.forEach(doc => students.push(doc.data()));
-
-    return students;
-
+    if (App.seesAll()) return await App._docs(db.collection("students"));
+    const own = await App._docs(App.scoped("students"));
+    const have = new Set(own.map(s => String(s.id)));
+    const enrollments = await App.getEnrollments();
+    const others = [...new Set(Object.values(enrollments).flat().map(String))].filter(id => !have.has(id));
+    return own.concat(await App.getStudentsByIds(others));
   } catch (e) {
-    console.warn("Firestore student read failed");
+    console.warn("Firestore student read failed", e);
   }
-
-  return [];   // ✅ no fallback
+  return [];
 };
+
+// Student records by ID (document ID = String(student.id)), cached for 20 seconds
+App.getStudentsByIds = async function (ids) {
+  const now = Date.now();
+  App._stuById = App._stuById || {};
+  const need = ids.map(String).filter(id => !(App._stuById[id] && now - App._stuById[id].at < 20000));
+  const snaps = await Promise.all(need.map(id => db.collection("students").doc(id).get()));
+  snaps.forEach((s, i) => { App._stuById[need[i]] = { at: now, data: s.exists ? s.data() : null }; });
+  return ids.map(id => (App._stuById[String(id)] || {}).data).filter(Boolean);
+};
+
+// Is this student one of the logged-in HOD's own (home department)?
+App.isOwnStudent = st => String(st.departmentId || "") === App.dept();
    
-  App.getSubjects = async function () {
+App.getSubjects = async function () {
   try {
-    const snapshot = await db.collection("subjects").get();
-
-    const subjects = [];
-    snapshot.forEach(doc => subjects.push(doc.data()));
-
-    return subjects;
-
+    if (App.role() === "Student") return (await App._studentData()).subjects;
+    return await App._docs(App.scoped("subjects"));
   } catch (e) {
-    console.warn("Firestore subject read failed");
+    console.warn("Firestore subject read failed", e);
   }
-
-  return [];   // ✅ no fallback
+  return [];
 };
 
-  App.getEnrollments = async function () {
+App.getEnrollments = async function () {
   try {
-    const snapshot = await db.collection("enrollments").get();
-
+    if (App.role() === "Student") return (await App._studentData()).enrollments;
     const enrollments = {};
-    snapshot.forEach(doc => {
+    (await App.scoped("enrollments").get()).forEach(doc => {
       enrollments[doc.id] = doc.data().students || [];
     });
-
     return enrollments;
-
   } catch (e) {
-    console.warn("Firestore enrollment read failed");
+    console.warn("Firestore enrollment read failed", e);
   }
-
-  return {};   // ✅ no fallback
+  return {};
 };
 
 App.getBatches = async function () {
   try {
-    const snapshot = await db.collection("batches").get();
-
-    const batches = [];
-    snapshot.forEach(doc => batches.push(doc.data()));
+    const batches = App.role() === "Student"
+      ? (await App._studentData()).batches
+      : await App._docs(App.scoped("batches"));
 
     // 🔥 FILTER OUT INVALID / GHOST BATCHES
     return batches.filter(b => b.id && b.semester && b.year && b.year !== 0);
@@ -1994,10 +2626,6 @@ App.getBatches = async function () {
 // Day Status System (Flexible Closures)
 // ==========================
 
-// 🔥 NEW: Always try Firestore first
-App.getDayStatuses = async function () {
-  return await App.getDayStatusesFromFirestore();
-};
 
 // 🔥 Keep local backup (for now)
 
@@ -2010,32 +2638,49 @@ App.getDayStatuses = async function () {
 //   timestamp: ISOString
 // }
 
-App.getDayStatus = async function (date) {
-  const map = await App.getDayStatuses();
+App.getDayStatus = async function (date, deptId) {
+  const map = await App.getDayStatuses(deptId);
   return map[date] || null;
 };
 
-
-// Returns true if saved
+// Close a day: an HOD for their department, the Institution Admin for everyone.
+// Returns true if saved.
 App.setDayStatus = async function (date, obj) {
-  return await App.saveDayStatusToFirestore(date, obj);
+  const dept = App.role() === "Admin" ? "ALL" : App.dept();
+  const id = dept === "ALL" ? date : `${dept}_${date}`;
+  try {
+    await db.collection("dayStatuses").doc(id).set({ ...obj, date, departmentId: dept });
+    App._dayCache = {};
+    return true;
+  } catch (e) {
+    console.error("Day status save failed:", e);
+    return false;
+  }
 };
 
-
-App.clearDayStatus = async function (date) {
-
-  // 🔥 Remove from Firestore
-  await db.collection("dayStatuses").doc(date).delete();
+App.clearDayStatus = async function (docId) {
+  await db.collection("dayStatuses").doc(docId).delete();
+  App._dayCache = {};
 };
 
+// The closed days a user manages or should see listed: for an HOD, the
+// institution's and their department's; for the Admin, the institution's.
+App.listClosedDays = async function () {
+  const q = App.role() === "Admin"
+    ? db.collection("dayStatuses").where("departmentId", "==", "ALL")
+    : db.collection("dayStatuses").where("departmentId", "in", ["ALL", App.dept()]);
+  const list = [];
+  (await q.get()).forEach(d => list.push({ docId: d.id, ...d.data() }));
+  return list.sort((a, b) => String(a.date).localeCompare(String(b.date)));
+};
 
-App.isClosedDay = async function (date) {
+App.isClosedDay = async function (date, deptId) {
   if (App.isSundayDate(date)) return {
     type: "sunday",
     reason: "Sunday"
   };
 
-  return await App.getDayStatus(date);
+  return await App.getDayStatus(date, deptId);
 };
 
 
@@ -2063,6 +2708,7 @@ App.cancelClass = async function ({ subjectId, date, teacherId, reason }) {
     date,
     teacherId,
     reason,
+    departmentId: App.dept(),
     timestamp: new Date().toISOString()
   };
 
@@ -2137,80 +2783,96 @@ const closedDayReason = document.getElementById("closedDayReason");
 const addClosedDayBtn = document.getElementById("addClosedDayBtn");
 const closedDayList = document.getElementById("closedDayList");
 
-async function renderClosedDays() {
-  const map = await App.getDayStatuses();
-  closedDayList.innerHTML = "";
+// One closed-days manager, used by the HOD (Admin Panel) and the Institution Admin
+App.Closures = {};
+App.Closures.render = async function (listEl) {
+  listEl.innerHTML = "<li>Loading…</li>";
+  let list = [];
+  try {
+    list = await App.listClosedDays();
+  } catch (e) {
+    console.error(e);
+    listEl.innerHTML = "<li style='color:red;'>Could not load closed days.</li>";
+    return;
+  }
+  listEl.innerHTML = "";
 
-  const dates = Object.keys(map).sort();
-
-  if (dates.length === 0) {
+  if (list.length === 0) {
     const li = document.createElement("li");
     li.textContent = "No closed days marked.";
     li.style.fontStyle = "italic";
-    closedDayList.appendChild(li);
+    listEl.appendChild(li);
     return;
   }
 
-  dates.forEach(date => {
-    const info = map[date];
+  const mine = c => (App.role() === "Admin") === (c.departmentId === "ALL");
+  list.forEach(info => {
     const li = document.createElement("li");
 
     li.innerHTML = `
-      <b>${App.esc(date)}</b> — ${App.esc(info.reason)}
-      <span style="margin-left:auto; color:#888;">(${App.esc(info.type)})</span>
+      <b>${App.esc(info.date)}</b> — ${App.esc(info.reason)}
+      <span style="margin-left:auto; color:#888;">(${App.esc(info.type)}${info.departmentId === "ALL" && App.role() !== "Admin" ? ", whole institution" : ""})</span>
     `;
 
-    const delBtn = document.createElement("button");
-    delBtn.textContent = "Remove";
-    delBtn.style.marginLeft = "10px";
+    if (mine(info)) {
+      const delBtn = document.createElement("button");
+      delBtn.textContent = "Remove";
+      delBtn.style.marginLeft = "10px";
 
-    delBtn.onclick = async () => {
-      delBtn.disabled = true;
-      try {
-        await App.clearDayStatus(date);
-      } catch (e) {
-        console.error(e);
-        await UI.alert("Could not remove the closed day. Check your internet connection and try again.");
-      }
-      await renderClosedDays();
-    };
-
-    li.appendChild(delBtn);
-    closedDayList.appendChild(li);
+      delBtn.onclick = async () => {
+        delBtn.disabled = true;
+        try {
+          await App.clearDayStatus(info.docId);
+        } catch (e) {
+          console.error(e);
+          await UI.alert("Could not remove the closed day. Check your internet connection and try again.");
+        }
+        await App.Closures.render(listEl);
+      };
+      li.appendChild(delBtn);
+    }
+    listEl.appendChild(li);
   });
-}
+};
 
-if (addClosedDayBtn) {
-  addClosedDayBtn.onclick = async () => {
-    const date = closedDayDate.value;
-    const type = closedDayType.value;
-    const reason = closedDayReason.value.trim();
+// Wire an "add closed day" form: { date, type, reason, btn, list } elements
+App.Closures.bind = function (els) {
+  els.btn.onclick = async () => {
+    const date = els.date.value;
+    const type = els.type.value;
+    const reason = els.reason.value.trim();
 
     if (!date || !reason) {
       UI.alert("Date and reason required");
       return;
     }
 
-    addClosedDayBtn.disabled = true;
+    els.btn.disabled = true;
     const saved = await App.setDayStatus(date, {
       date,
       type,
       reason,
-      markedBy: "HOD",
+      markedBy: (Auth.currentUser() || {}).loginId || App.role(),
       timestamp: new Date().toISOString()
     });
-    addClosedDayBtn.disabled = false;
+    els.btn.disabled = false;
 
     if (!saved) {
       UI.alert("Could not mark the day closed. Check your internet connection and try again.");
       return;
     }
-    closedDayDate.value = "";
-    closedDayReason.value = "";
+    els.date.value = "";
+    els.reason.value = "";
 
-    await renderClosedDays();
+    await App.Closures.render(els.list);
   };
+};
+
+const renderClosedDays = () => App.Closures.render(closedDayList);
+if (addClosedDayBtn) {
+  App.Closures.bind({ date: closedDayDate, type: closedDayType, reason: closedDayReason, btn: addClosedDayBtn, list: closedDayList });
 }
+
 
 
   const subjectInput = document.getElementById("subjectNameInput");
@@ -2281,6 +2943,17 @@ function loadSemesterOptions(program) {
 
 // initial load
 loadSemesterOptions(batchProgram.value);
+
+// Offer only the programmes the department runs (set by the Institution Admin)
+App.limitProgrammes = async function () {
+  const dept = (await App.getDepartments())[App.dept()];
+  const allowed = dept && Array.isArray(dept.programs) && dept.programs.length ? dept.programs : ["UG", "PG", "IG"];
+  [...batchProgram.options].forEach(o => { o.hidden = o.disabled = !allowed.includes(o.value); });
+  if (!allowed.includes(batchProgram.value)) {
+    batchProgram.value = allowed[0];
+    loadSemesterOptions(batchProgram.value);
+  }
+};
 
 // update on program change
 batchProgram.onchange = () => {
@@ -2474,6 +3147,7 @@ addBatchBtn.onclick = async () => {
  try {
   await App.saveBatchToFirestore({
     id: batchId,
+    departmentId: App.dept(),
     program,
     semester,
     year: Number(year),
@@ -2598,7 +3272,7 @@ if (hasAttendance) {
   const id = Date.now();
 
   const newSubject = {
-    id, name, batchId: batch.id, type,
+    id, name, batchId: batch.id, type, departmentId: App.dept(),
     program: batch.program, semester: batch.semester, year: batch.year
   };
 
@@ -2814,7 +3488,7 @@ if (hasAttendance) {
     if (!teacher) throw new Error("Could not save the teacher.");
     await App.Accounts.issueLogin({
       loginId: username, password,
-      profile: { role: "Teacher", name, teacherId: String(teacher.id) },
+      profile: { role: "Teacher", name, teacherId: String(teacher.id), departmentId: App.dept() },
       owner: { collection: "teachers", id: teacher.id, data: teacher }
     });
     UI.alert(`Teacher added.\n\nLogin ID: ${username}\nStarting password: ${password}\n\n` +
@@ -2873,7 +3547,7 @@ if (uploadTeacherExcelBtn) {
           if (!teacher) throw new Error("Could not save the teacher.");
           await App.Accounts.issueLogin({
             loginId: uname, password,
-            profile: { role: "Teacher", name, teacherId: String(teacher.id) },
+            profile: { role: "Teacher", name, teacherId: String(teacher.id), departmentId: App.dept() },
             owner: { collection: "teachers", id: teacher.id, data: teacher }
           });
           added++;
@@ -3153,6 +3827,7 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
   const enrollments = await App.getEnrollments();
   const students = await App.getStudents();
   const batches = await App.getBatches();
+  const depts = await App.getDepartments();
 
   // ✅ ONLY current enrolled students (no historyIndex anymore)
   const currentIds = (enrollments[String(subjectId)] || []).map(String);
@@ -3179,10 +3854,12 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
     const status = st.status || "ACTIVE";
     const statusColor = status === "ACTIVE" ? "green" : (status === "GRADUATED" ? "blue" : "red");
     
+    const own = App.isOwnStudent(st);
     const text = document.createElement("span");
-    text.innerHTML = `${index + 1}. <b>${App.esc(st.roll)}</b> - ${App.esc(st.name)} <span style="color:${statusColor}">[${App.esc(status)}]</span>`;
+    text.innerHTML = `${index + 1}. <b>${App.esc(st.roll)}</b> - ${App.esc(st.name)} <span style="color:${statusColor}">[${App.esc(status)}]</span>` +
+      (own ? "" : ` <small style="color:#6b7280;">(${App.esc((depts[st.departmentId] || {}).name || "other department")} student)</small>`);
     li.appendChild(text);
-    if (status === "ACTIVE") {
+    if (status === "ACTIVE" && own) {
       const deleteBtn = document.createElement("button");
       deleteBtn.innerHTML = "🗑️ Delete"; 
       deleteBtn.style.marginLeft = "15px";
@@ -3235,8 +3912,8 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
       li.appendChild(deleteBtn);
       }
 
-    // 🎓 2. THE IG/UG DIFFERENTIATOR
-    if (status === "ACTIVE") {
+    // 🎓 2. THE IG/UG DIFFERENTIATOR (exits are handled by the student's own department)
+    if (status === "ACTIVE" && own) {
       const exitBtn = document.createElement("button");
       
       // ✅ Assigning unique labels and colors based on program
@@ -3342,15 +4019,17 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
 
 
 
-  let students = await App.getStudents();
   let enrollments = await App.getEnrollments();
   const subjects = await App.getSubjects();
+  const subjectNow = subjects.find(s => String(s.id) === String(subjectId));
 
-  // 1. Find or Create the Student in the Batch "Master Stock"
-  let student = students.find(s => 
-    String(s.roll).trim() === roll && 
-    String(s.batchId) === String(batchId)
-  );
+  // 1. The same roll number in any department is the same student
+  let student = (await App.findStudentsByRoll([roll]))[roll];
+  if (!student && subjectNow && !App.isHomeSubject(subjectNow, await App.getBatches()) &&
+      !await UI.confirm(`No student with roll number ${roll} exists in any department.\n\n` +
+        `Add ${name} as a new student of THIS department? (If they belong to another department, their HOD should add them first.)`)) {
+    return;
+  }
 
   if (!student) {
     student = {
@@ -3358,14 +4037,14 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
       name,
       roll,
       batchId,
+      departmentId: App.dept(),
       status: "ACTIVE"
     };
-    try {
-  await App.saveStudentToFirestore(student);
-} catch (e) {
-  console.warn("Firestore student mirror failed", e);
-}
-    students.push(student);
+    if (!(await App.saveStudentToFirestore(student))) {
+      status.textContent = "Save failed. Check your internet connection and try again.";
+      status.style.color = "red";
+      return;
+    }
   }
 
   // 2. Which subjects should this student join? (rules: App.syncTerritory)
@@ -3387,7 +4066,7 @@ document.getElementById("loadStudentManagerBtn").onclick = async function () {
     await App.commitWrites(touched.map(sid => ({
       collection: "enrollments",
       id: sid,
-      data: { subjectId: sid, students: enrollments[sid] || [] }
+      data: { subjectId: sid, students: enrollments[sid] || [], departmentId: App.dept() }
     })));
   } catch (e) {
     console.error(e);
@@ -3438,39 +4117,49 @@ uploadExcelBtn.onclick = () => {
     const decoded = App.decodeBatchKey(batchId);
     const cleanBatchId = decoded ? decoded.id : batchId;
 
-    let students = await App.getStudents();
     let enrollments = await App.getEnrollments();
     const newStudents = [];                       // students to create in Firestore
     const touchedSubjects = new Set([String(subjectId)]); // enrollments to save
+    const notFound = [];                          // unknown roll numbers not added
+    let fromOtherDepts = 0;
 
     if (!enrollments[String(subjectId)]) {
       enrollments[String(subjectId)] = [];
     }
 
+    const allSubjects = await App.getSubjects();   // load once
+    const batchesNow = await App.getBatches();
+    const uploadedSubject = allSubjects.find(s => String(s.id) === String(subjectId));
+    const mayCreate = !uploadedSubject || App.isHomeSubject(uploadedSubject, batchesNow);
+    const rows = jsonData
+      .map(row => ({ name: String(row.name || row.Name || "").trim(), roll: String(row.roll || row.Roll || "").trim() }))
+      .filter(r => r.name && r.roll);
+    // The same roll number in any department is the same student
+    uploadStatus.textContent = "Checking roll numbers…";
+    uploadStatus.style.color = "#555";
+    const known = await App.findStudentsByRoll(rows.map(r => r.roll));
+
     // --------------------------
     // 1. Create students + enroll using the CLEAN ID
     // --------------------------
-    jsonData.forEach(row => {
-      const name = String(row.name || row.Name || "").trim();
-      const roll = String(row.roll || row.Roll || "").trim();
+    rows.forEach(({ name, roll }) => {
+      let student = known[roll];
+      if (student && !App.isOwnStudent(student)) fromOtherDepts++;
 
-      if (!name || !roll) return;
-
-      // ✅ BATCH-AWARE SEARCH (Matches existing master records using clean ID)
-      let student = students.find(st => 
-        String(st.roll).trim() === roll && 
-        String(st.batchId) === String(cleanBatchId)
-      );
-
+      if (!student && !mayCreate) {
+        notFound.push(roll);
+        return;
+      }
       if (!student) {
         student = {
           id: Date.now() + Math.random(),
           name,
           roll,
           batchId: cleanBatchId, // 🔒 Store only the clean numeric ID
+          departmentId: App.dept(),
           status: "ACTIVE"
         };
-        students.push(student);
+        known[roll] = student;
         newStudents.push(student);
       }
 
@@ -3482,26 +4171,17 @@ uploadExcelBtn.onclick = () => {
 // 🔁 UNIFIED TERRITORIAL SYNC (Fixed for UG/IG/PG)
 // ==========================
 
-const allSubjects = await App.getSubjects();   // load once
-const uploadedSubject = allSubjects.find(
-  s => String(s.id) === String(subjectId)
-);
-
 if (uploadedSubject) {
   // Rules live in App.syncTerritory (PG: all subjects; UG/IG: same type) — this semester onward
-  const territorySubjects = App.syncTerritory(uploadedSubject, allSubjects, await App.getBatches());
+  const territorySubjects = App.syncTerritory(uploadedSubject, allSubjects, batchesNow);
 
       territorySubjects.forEach(relSub => {
         const sid = String(relSub.id);
         if (!enrollments[sid]) enrollments[sid] = [];
         touchedSubjects.add(sid);
 
-        jsonData.forEach(row => {
-          const roll = String(row.roll || row.Roll || "").trim();
-          const foundSt = students.find(st =>
-            String(st.roll).trim() === roll &&
-            String(st.batchId) === String(cleanBatchId)
-          );
+        rows.forEach(({ roll }) => {
+          const foundSt = known[roll];
 
           if (foundSt && !enrollments[sid].map(String).includes(String(foundSt.id))) {
             enrollments[sid].push(foundSt.id);
@@ -3521,7 +4201,7 @@ if (uploadedSubject) {
         ...[...touchedSubjects].map(sid => ({
           collection: "enrollments",
           id: sid,
-          data: { subjectId: sid, students: enrollments[sid] || [] }
+          data: { subjectId: sid, students: enrollments[sid] || [], departmentId: App.dept() }
         }))
       ];
       await App.commitWrites(writes);
@@ -3531,8 +4211,12 @@ if (uploadedSubject) {
       uploadStatus.style.color = "red";
       return;
     }
-    uploadStatus.textContent = `Upload successful! ${newStudents.length} new student(s) added, ${touchedSubjects.size} subject(s) updated.`;
-    uploadStatus.style.color = "green";
+    uploadStatus.textContent = `Upload successful! ${newStudents.length} new student(s) added, ` +
+      (fromOtherDepts ? `${fromOtherDepts} from other departments enrolled, ` : "") +
+      `${touchedSubjects.size} subject(s) updated.` +
+      (notFound.length ? ` Not added — no such roll number in any department: ${notFound.join(", ")}. ` +
+        `Their home department must add them first, then upload again.` : "");
+    uploadStatus.style.color = notFound.length ? "#b45309" : "green";
 
     loadSubjectsForStudentUpload(); 
     loadBatchesForStudentUpload(); 
@@ -3686,7 +4370,7 @@ const archiveResults = document.getElementById("archiveResults");
   const loadExitRegistryBtn = document.getElementById("loadExitRegistryBtn");
   if (loadExitRegistryBtn) {
   loadExitRegistryBtn.onclick = async function() {
-    const students = await App.getStudents() || [];
+    const students = (await App.getStudents() || []).filter(App.isOwnStudent);
    const output = document.getElementById("exitRegistryOutput");
    if (!output) return;
     
@@ -3844,7 +4528,7 @@ html += "</tbody></table>";
     if (!subject) { showMessage("Subject not found."); return; }
 
     if (!(await App.isBatchOpen(subject.batchId, subject.semester))) { if (!stale()) showMessage("Semester is closed."); return; }
-    if (await App.isClosedDay(date)) { if (!stale()) showMessage("Day is closed."); return; }
+    if (await App.isClosedDay(date, subject.departmentId || App.dept())) { if (!stale()) showMessage("Day is closed."); return; }
     if (stale()) return;
     if (date > new Date().toLocaleDateString("en-CA")) { showMessage("Attendance can't be marked for a future date."); return; }
 
@@ -4006,6 +4690,7 @@ html += "</tbody></table>";
     });
     const attendanceRecord = {
       subjectId: String(subjectSelect.value),
+      departmentId: App.dept(),
       date: dateInput.value,
       records: records,
       timestamp: Date.now(),
@@ -4013,9 +4698,20 @@ html += "</tbody></table>";
       markedAt: new Date().toISOString()
     };
 
+    // Counts for the Principal's dashboard (leaves are recorded as Absent plus a leave record)
+    const values = Object.values(records);
+    const present = values.filter(v => v === "Present").length;
+    const summary = {
+      departmentId: App.dept(), subjectId: attendanceRecord.subjectId, date: attendanceRecord.date,
+      subjectName: (subjectSelect.options[subjectSelect.selectedIndex] || {}).textContent || "",
+      teacherId: attendanceRecord.markedBy, teacherName: Auth.currentUser().name || "",
+      present, leave: leavesToSave.length, absent: values.length - present - leavesToSave.length,
+      markedAt: attendanceRecord.markedAt
+    };
+
     saveBtn.disabled = true;
     saveStatus.textContent = "Saving…";
-    const saved = await App.saveAttendanceToFirestore(attendanceRecord);
+    const saved = await App.saveAttendanceToFirestore(attendanceRecord, summary);
     if (!saved.ok) {
       saveStatus.textContent = "NOT saved.";
       await UI.alert("Attendance was NOT saved.\n\nCheck your internet connection and try again. " +
@@ -4676,18 +5372,34 @@ App.SECTION_RULES = {
   ],
   Student: [
     "studentDashboardSection"     // dashboard includes "My day-by-day register"
+  ],
+  Admin: [
+    "institutionSection",
+    "principalSection"
+  ],
+  Principal: [
+    "principalSection"
+  ],
+  // HOD, teacher or student account from before departments existed
+  Legacy: [
+    "upgradeSection"
   ]
 };
-App.canAccess = function (sectionId) {
+App.effectiveRole = function () {
   const u = Auth.currentUser();
-  return !!u && (App.SECTION_RULES[u.role] || []).includes(sectionId);
+  if (!u) return "";
+  if (["HOD", "Teacher", "Student"].includes(u.role) && !u.departmentId) return "Legacy";
+  return u.role;
+};
+App.canAccess = function (sectionId) {
+  return (App.SECTION_RULES[App.effectiveRole()] || []).includes(sectionId);
 };
 
 function applyRoleGuards() {
   const user = Auth.currentUser();
   if (!user) return;
 
-  const role = user.role;
+  const role = App.effectiveRole();
 
 const rules = App.SECTION_RULES;
 
@@ -4728,7 +5440,11 @@ const rules = App.SECTION_RULES;
     badge.style.fontSize = "12px";
     document.body.appendChild(badge);
   }
-  badge.textContent = `Logged in as: ${role}`;
+  const roleName = { Admin: "Institution Admin", Legacy: user.role }[role] || role;
+  badge.textContent = `Logged in as: ${roleName}`;
+  App.departmentName().then(name => {
+    if (name && App.dept()) badge.textContent = `Logged in as: ${roleName} · ${name}`;
+  }).catch(() => {});
 }
 
 // ==========================
@@ -4854,6 +5570,8 @@ if (printBtn) {
     }
 
     const today = new Date().toLocaleDateString();
+    const college = App.esc(await App.institutionName());
+    const deptName = App.esc(await App.departmentName());
 
     const html = `
       <html>
@@ -4874,8 +5592,8 @@ if (printBtn) {
       <body>
 
         <div class="center">
-          <div class="title">AMAR SINGH COLLEGE, SRINAGAR</div>
-          <div class="subtitle">DEPARTMENT OF ECONOMICS</div>
+          <div class="title">${college.toUpperCase()}</div>
+          <div class="subtitle">DEPARTMENT OF ${deptName.toUpperCase()}</div>
           <div class="title" style="margin-top:20px;">OFFICE ORDER</div>
         </div>
 
@@ -4906,8 +5624,8 @@ if (printBtn) {
           <div style="text-align:right;">
             __________________________<br>
             <b>Head of Department</b><br>
-            Department of Economics<br>
-            Amar Singh College, Srinagar
+            Department of ${deptName}<br>
+            ${college}
           </div>
         </div>
 
@@ -4989,9 +5707,9 @@ App.enterApp = function (restoreLastSection) {
   resetIdleTimer();
   const user = Auth.currentUser();
   if (!user) { App.showLoginScreen(); return; }
-  const home = user.role === "Student" ? "studentDashboardSection"
-             : user.role === "HOD" ? "hodDashboardSection"
-             : "attendanceSection";
+  const role = App.effectiveRole();
+  const home = { Student: "studentDashboardSection", HOD: "hodDashboardSection", Admin: "institutionSection",
+                 Principal: "principalSection", Legacy: "upgradeSection" }[role] || "attendanceSection";
   const last = restoreLastSection ? localStorage.getItem("lastSection") : null;
   showSection(last && App.canAccess(last) ? last : home);
 };
@@ -5022,11 +5740,11 @@ App.resumeSession = async function (fbUser) {
   App.enterApp(true);
 };
 
-// ---------- First-time HOD setup ----------
+// ---------- First-time setup (Institution Admin) ----------
 App.refreshSetupLink = async function () {
   const link = document.getElementById("setupLink");
   if (!link) return;
-  link.style.display = (await Auth.isSetupDone()) ? "none" : "inline";
+  link.style.display = (await Auth.setupState()) === "new" ? "inline" : "none";
 };
 
 App.initSetupPanel = function () {
@@ -5041,27 +5759,29 @@ App.initSetupPanel = function () {
     panel.style.display = panel.style.display === "none" ? "block" : "none";
   };
   btn.onclick = async () => {
+    const institutionName = document.getElementById("setupInstitution").value.trim();
     const name = document.getElementById("setupName").value.trim();
     const loginId = Auth.normalizeLoginId(document.getElementById("setupLoginId").value);
     const pw = document.getElementById("setupPassword").value;
     const pw2 = document.getElementById("setupPassword2").value;
     msg.style.color = "red";
-    if (!name) { msg.textContent = "Enter the HOD's name."; return; }
-    if (!Auth.isValidLoginId(loginId)) { msg.textContent = "Login ID: letters, numbers, dots or dashes (e.g. hod)."; return; }
+    if (!institutionName) { msg.textContent = "Enter the institution's name."; return; }
+    if (!name) { msg.textContent = "Enter your name."; return; }
+    if (!Auth.isValidLoginId(loginId)) { msg.textContent = "Login ID: letters, numbers, dots or dashes (e.g. admin)."; return; }
     if (pw.length < 8) { msg.textContent = "Password must be at least 8 characters."; return; }
     if (pw !== pw2) { msg.textContent = "The two passwords don't match."; return; }
 
     btn.disabled = true;
     msg.style.color = "#555";
-    msg.textContent = "Creating HOD account…";
+    msg.textContent = "Creating the Institution Admin account…";
     try {
-      await Auth.setupHod(loginId, name, pw);
+      await Auth.setupInstitution({ institutionName, name, loginIdRaw: loginId, password: pw });
       panel.style.display = "none";
       link.style.display = "none";
       ["setupPassword", "setupPassword2"].forEach(id => document.getElementById(id).value = "");
       msg.textContent = "";
       App.enterApp(false);
-      UI.alert(`HOD account created.\n\nFrom now on, log in with:\nLogin ID: ${loginId}\nand the password you just chose.`);
+      UI.alert(`Institution Admin account created.\n\nFrom now on, log in with:\nLogin ID: ${loginId}\nand the password you just chose.\n\nNext: add departments and create each HOD's login.`);
     } catch (e) {
       console.error(e);
       msg.style.color = "red";
@@ -5202,7 +5922,7 @@ function showSection(id) {
 
   const rules = App.SECTION_RULES;
 
-   const allowed = rules[user.role] || [];
+   const allowed = rules[App.effectiveRole()] || [];
 
    if (!allowed.includes(id)) {
   UI.alert("Access denied.");
@@ -5252,9 +5972,16 @@ if (id !== "archiveSection") {
     renderClosedDays();
     App.Accounts.loadStudentLoginBatches();
     App.Settings.load();
+    App.limitProgrammes();
+    App.departmentName().then(name => {
+      if (templateSelect) templateSelect.style.display = /econom/i.test(name) ? "" : "none";
+    });
     App.StudentViews.initRebuildButton();
   }
   if (id === "hodDashboardSection") App.HodDash.init();
+  if (id === "institutionSection") App.Institution.init();
+  if (id === "principalSection") App.Principal.init();
+  if (id === "upgradeSection") App.Upgrade.init();
 
   if (id === "correctionsSection") { App.CorrectionsPanel.init(); App.HODCorrections.init(); }
   if (id === "myRequestsSection") App.MyRequests.init();
@@ -5283,7 +6010,7 @@ if (id !== "archiveSection") {
 
 App.getCorrectionRequests = async function () {
   try {
-    const snapshot = await db.collection("correctionRequests").get();
+    const snapshot = await App.scoped("correctionRequests").get();
     const list = [];
     snapshot.forEach(doc => list.push(doc.data()));
     return list;
@@ -5295,7 +6022,7 @@ App.getCorrectionRequests = async function () {
 
 App.getAttendanceCorrections = async function () {
   try {
-    const snapshot = await db.collection("attendanceCorrections").get();
+    const snapshot = await App.scoped("attendanceCorrections").get();
     const list = [];
     snapshot.forEach(doc => list.push(doc.data()));
     return list;
@@ -5340,6 +6067,7 @@ const original = App._attendanceCache[key];
   reason,
   requestedBy: user.id,
   requestedAt: new Date().toISOString(),
+  departmentId: App.dept(),
   status: "pending"
 };
   // 🔥 NEW: save to Firestore
@@ -5381,6 +6109,7 @@ const req = doc.data();
   reason: req.reason,
   requestedBy: req.requestedBy,
   approvedBy: user.username || "HOD",
+  departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
   try {
@@ -5440,6 +6169,7 @@ const req = doc.data();
   reason: req.reason,
   requestedBy: req.requestedBy,
   approvedBy: user.username || "HOD",
+  departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
   try {
@@ -5481,7 +6211,7 @@ App.CorrectionsPanel.init = async function () {
 
    
   if (App._corrUnsub) App._corrUnsub();
-  App._corrUnsub = db.collection("correctionRequests")
+  App._corrUnsub = App.scoped("correctionRequests")
   .onSnapshot(async snapshot => {
 
     const requests = [];
@@ -5611,7 +6341,7 @@ App.MyRequests.init = async function () {
     return;
   }
 if (App._corrUnsub) App._corrUnsub();
-App._corrUnsub = db.collection("correctionRequests")
+App._corrUnsub = App.scoped("correctionRequests")
 .onSnapshot(async snapshot => {
 
   const requests = [];
@@ -5822,7 +6552,7 @@ function exportToExcel() {
 // HOD EXECUTIVE DASHBOARD (ENHANCED)
 // ==========================================
   App.updateHODStats = async function() {
-  const students = await App.getStudents();
+  const students = (await App.getStudents()).filter(App.isOwnStudent);
   const today = new Date().toLocaleDateString("en-CA");   // local date, YYYY-MM-DD
   const subjects = await App.getSubjects();
 
@@ -5847,7 +6577,7 @@ function exportToExcel() {
       if (s === "Present") totalPresentToday++;
       if (s === "Absent") totalAbsentToday++;
     });
-    totalAbsentToday -= (await App._getDocsByIdPrefix("leaves", `${sub.id}_${today}_`)).length;   // leave is not absence
+    totalAbsentToday -= (await App.getLeavesFor(sub.id, today)).length;   // leave is not absence
   }
 }
 
@@ -5889,7 +6619,7 @@ function exportToExcel() {
 // ==========================================
 // OFFICIAL ALUMNI PDF GENERATOR
 // ==========================================
-App.downloadAlumniPDF = function() {
+App.downloadAlumniPDF = async function() {
   const table = document.querySelector("#exitRegistryOutput table");
   if (!table) {
     UI.alert("No records found to export.");
@@ -5897,16 +6627,18 @@ App.downloadAlumniPDF = function() {
   }
 
   const today = new Date().toLocaleDateString();
+  const college = App.esc(await App.institutionName());
+  const deptName = App.esc(await App.departmentName());
   const html = `
     <div style="font-family: 'Times New Roman', serif; padding: 40px;">
       <div style="text-align: center;">
-        <h2 style="margin:0;">AMAR SINGH COLLEGE, SRINAGAR</h2>
-        <h3 style="margin:5px 0;">DEPARTMENT OF ECONOMICS</h3>
+        <h2 style="margin:0;">${college.toUpperCase()}</h2>
+        <h3 style="margin:5px 0;">DEPARTMENT OF ${deptName.toUpperCase()}</h3>
         <h4 style="text-decoration: underline; margin-top:20px;">OFFICIAL ALUMNI & EXIT REGISTRY</h4>
       </div>
       
       <p style="margin-top:30px;"><b>Date of Report:</b> ${today}</p>
-      <p>The following students have officially completed their tenure or exited from the Department of Economics as per the records maintained in the Digital Attendance System.</p>
+      <p>The following students have officially completed their tenure or exited from the Department of ${deptName} as per the records maintained in the Digital Attendance System.</p>
       
       <div style="margin-top:20px;">
         ${table.outerHTML}
@@ -5918,7 +6650,7 @@ App.downloadAlumniPDF = function() {
         </div>
         <div style="text-align:right;">
           <p>__________________________</p>
-          <p><b>Head of Department</b><br>Department of Economics</p>
+          <p><b>Head of Department</b><br>Department of ${deptName}</p>
         </div>
       </div>
     </div>
@@ -5926,7 +6658,7 @@ App.downloadAlumniPDF = function() {
 
   const opt = {
     margin: 0.5,
-    filename: `Economics_Alumni_Report_${today}.pdf`,
+    filename: `${(deptName || "Department").replace(/[^A-Za-z0-9]+/g, "_")}_Alumni_Report_${today}.pdf`,
     image: { type: 'jpeg', quality: 0.98 },
     html2canvas: { scale: 2 },
     jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }

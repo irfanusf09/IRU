@@ -1,25 +1,38 @@
 rules_version = '2';
 
 // =====================================================================
-// Department Attendance System — Firestore Security Rules
+// Attendance System — Firestore Security Rules
+//
+// One institution, many departments. Every record carries departmentId
+// (the department that owns it: a subject's records belong to the
+// department that offers the subject).
 //
 // Who can do what (enforced by Google's servers, not by the app):
-//   HOD      : reads everything; manages batches, subjects, students,
-//              teachers, accounts, closures; approves corrections.
-//              Cannot create or change attendance records.
-//   Teacher  : reads class data; marks attendance ONCE per class per day,
-//              only for subjects assigned to them, and only on a day the
-//              class could have met (not Sunday, a closed day, a class
-//              marked not held, a future date, or a semester that is not
-//              ACTIVE); requests corrections; marks own classes as not held.
+//   Institution Admin : creates departments; manages HOD and Principal
+//              accounts (and can reset anyone's); institution settings;
+//              closes days for the whole institution; reads everything.
+//              Never creates or changes attendance.
+//   Principal: reads everything. Changes nothing.
+//   HOD      : everything for THEIR department: batches, subjects,
+//              students, teachers, teacher/student accounts, closures,
+//              correction decisions. Reads only their department's
+//              attendance. Cannot create or change attendance records.
+//   Teacher  : marks attendance ONCE per class per day, only for subjects
+//              assigned to them, and only on a day the class could have
+//              met (not Sunday, an institution or department closed day,
+//              a class marked not held, a future date, or a semester that
+//              is not ACTIVE); requests corrections; marks classes not held.
 //   Student  : reads only their own student record and their own
-//              attendance copies (studentViews), plus class-level data
-//              (subjects, closed days, classes not held). Never other
-//              students' attendance, leaves or corrections.
+//              attendance copies (studentViews), plus class-level data.
 //   Anyone not logged in: can only look up a login ID (to sign in).
 //
 // Saved attendance can never be edited or deleted through the app.
 // Changes go through correction requests approved by the HOD.
+//
+// Upgrading a single-department install: the existing HOD appoints the
+// Institution Admin once (config/institution); the Admin then tags the
+// old records with a department ("claim"). Old records without a
+// department can't be used until then.
 //
 // Dates are the college's local (India, UTC+5:30) calendar dates.
 // =====================================================================
@@ -28,38 +41,82 @@ service cloud.firestore {
   match /databases/{database}/documents {
 
     // ---------- Helpers ----------
+    function doc(collection, id) { return /databases/$(database)/documents/$(collection)/$(id); }
     function signedIn() { return request.auth != null; }
-    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function profilePath() { return doc("users", request.auth.uid); }
     function hasProfile() { return signedIn() && exists(profilePath()); }
     function me() { return get(profilePath()).data; }
     function isActive() { return hasProfile() && me().active == true; }
+    function isAdmin() { return isActive() && me().role == "Admin"; }
+    function isPrincipal() { return isActive() && me().role == "Principal"; }
     function isHod() { return isActive() && me().role == "HOD"; }
     function isTeacher() { return isActive() && me().role == "Teacher"; }
     function isStudent() { return isActive() && me().role == "Student"; }
     function isStaff() { return isHod() || isTeacher(); }
     function anyUser() { return isActive(); }
+    function myDept() { return me().get("departmentId", ""); }
 
-    function assignmentPath(subjectId) {
-      return /databases/$(database)/documents/subjectAssignments/$(subjectId);
+    // Whole-institution readers
+    function seesAll() { return isAdmin() || isPrincipal(); }
+    // HOD of department d
+    function isHodOf(d) { return isHod() && d is string && d != "" && myDept() == d; }
+    // May read department d's attendance-type records
+    function canRead(d) { return seesAll() || (isStaff() && d is string && d != "" && myDept() == d); }
+    // ...or check that one doesn't exist yet (e.g. today's attendance before it is saved)
+    function canReadRecord() {
+      return (resource == null && (isStaff() || seesAll()))
+        || (resource != null && canRead(resource.data.get("departmentId", "")));
     }
+
+    // HOD writes to a department-owned record: the record is (and stays) theirs
+    function hodCreates() { return isHodOf(request.resource.data.get("departmentId", "")); }
+    function hodUpdates() {
+      return isHodOf(resource.data.get("departmentId", ""))
+        && request.resource.data.get("departmentId", "") == resource.data.get("departmentId", "");
+    }
+    function hodDeletes() { return isHodOf(resource.data.get("departmentId", "")); }
+
+    // Admin tags an old (pre-departments) record with a department; nothing else changes
+    function claimsLegacy() {
+      return isAdmin()
+        && !("departmentId" in resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["departmentId"])
+        && request.resource.data.departmentId is string
+        && exists(doc("departments", request.resource.data.departmentId));
+    }
+
     // Is the logged-in teacher assigned to this subject?
     function teaches(subjectId) {
       return isTeacher()
         && subjectId is string
-        && exists(assignmentPath(subjectId))
-        && get(assignmentPath(subjectId)).data.teacherId == me().teacherId;
+        && exists(doc("subjectAssignments", subjectId))
+        && get(doc("subjectAssignments", subjectId)).data.teacherId == me().teacherId;
     }
-    function hodSetupDone() { return exists(/databases/$(database)/documents/config/hod); }
-    function doc(collection, id) { return /databases/$(database)/documents/$(collection)/$(id); }
+
+    // ---------- One-time setup ----------
+    function institutionPath() { return doc("config", "institution"); }
+    function institutionSetUp() { return exists(institutionPath()); }
+    function legacyInstall() { return exists(doc("config", "hod")); }
+    // During setup: on a new install the person setting up becomes the
+    // Admin; on an old single-department install only its HOD may appoint one.
+    function setupAppoints(adminUid) {
+      return signedIn()
+        && !institutionSetUp()
+        && getAfter(institutionPath()).data.adminUid == adminUid
+        && ((!legacyInstall() && request.auth.uid == adminUid)
+            || (legacyInstall() && get(doc("config", "hod")).data.uid == request.auth.uid));
+    }
 
     // Could this class have met on this date? ("YYYY-MM-DD", already format-checked)
-    function classCouldMeet(subjectId, date) {
+    function classCouldMeet(subjectId, date, dept) {
       let day = timestamp.date(int(date[0:4]), int(date[5:7]), int(date[8:10]));
       let subject = get(doc("subjects", subjectId)).data;
-      return day.dayOfWeek() != 7                                      // not a Sunday
-        && day <= request.time + duration.value(330, "m")              // not in the future (India time)
-        && !exists(doc("dayStatuses", date))                         // HOD has not closed the day
-        && !exists(doc("classCancellations", subjectId + "_" + date)) // not marked "not held"
+      return subject.get("departmentId", "") == dept
+        && day.dayOfWeek() != 7                                          // not a Sunday
+        && day <= request.time + duration.value(330, "m")                // not in the future (India time)
+        && !exists(doc("dayStatuses", date))                             // institution has not closed the day
+        && !exists(doc("dayStatuses", dept + "_" + date))                // department has not closed the day
+        && !exists(doc("classCancellations", subjectId + "_" + date))    // not marked "not held"
         && get(doc("batches", string(subject.batchId) + "_" + string(subject.semester))).data.status == "ACTIVE";
     }
 
@@ -79,7 +136,8 @@ service cloud.firestore {
         && v.studentId is string
         && last is string
         && viewId == v.studentId + "_" + v.subjectId
-        && v.keys().hasOnly(["studentId", "subjectId", "days", "leaves", "corrections", "last"])
+        && v.get("departmentId", "") == myDept()
+        && v.keys().hasOnly(["studentId", "subjectId", "departmentId", "days", "leaves", "corrections", "last"])
         && v.get("corrections", {}) == oldCorrections
         && dayChanged.hasOnly([last])
         && leaveChanged.hasOnly([last])
@@ -89,37 +147,59 @@ service cloud.firestore {
             || leaves[last] == get(doc("leaves", v.subjectId + "_" + last + "_" + v.studentId)).data.type);
     }
 
-    // ---------- One-time HOD setup ----------
-    // The very first account to complete setup becomes HOD. Afterwards
-    // config/hod exists and this can never happen again.
+    // ---------- Institution ----------
+    match /config/institution {
+      allow get: if true;
+      allow create: if request.resource.data.keys().hasOnly(["adminUid", "name", "createdAt"])
+        && request.resource.data.adminUid is string
+        && getAfter(doc("users", request.resource.data.adminUid)).data.role == "Admin"
+        && setupAppoints(request.resource.data.adminUid);
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["name", "migratedAt"]);
+      allow delete: if false;
+    }
+
+    // Old single-department installs only (no longer created)
     match /config/hod {
       allow get: if true;
-      allow create: if signedIn()
-        && request.resource.data.keys().hasOnly(["uid", "createdAt"])
-        && request.resource.data.uid == request.auth.uid
-        && getAfter(profilePath()).data.role == "HOD";
-      allow update, delete: if false;
+      allow write: if false;
+    }
+
+    match /config/settings {
+      allow read: if anyUser();
+      allow write: if isAdmin();
+    }
+
+    match /departments/{id} {
+      allow read: if anyUser();
+      allow write: if isAdmin();
     }
 
     // ---------- Accounts ----------
+    // An HOD manages only Teacher and Student accounts of their own department.
+    function hodManagesAccount(data) {
+      return isHod()
+        && data.get("departmentId", "") == myDept()
+        && myDept() != ""
+        && data.get("role", "") in ["Teacher", "Student"];
+    }
     match /users/{uid} {
-      allow get: if signedIn() && (request.auth.uid == uid || isHod());
-      allow list: if isHod();
-      allow create: if isHod()
-        || (signedIn()
-            && request.auth.uid == uid
-            && request.resource.data.role == "HOD"
-            && !hodSetupDone()
-            && getAfter(/databases/$(database)/documents/config/hod).data.uid == uid);
-      // HOD manages accounts; a user may only clear their own
-      // "must change password" flag and record their own recovery email.
-      allow update: if isHod()
+      allow get: if signedIn() && (request.auth.uid == uid || isAdmin()
+                                  || (isHod() && resource.data.get("departmentId", "") == myDept() && myDept() != ""));
+      allow list: if isAdmin() || (isHod() && resource.data.get("departmentId", "") == myDept() && myDept() != "");
+      allow create: if isAdmin()
+        || hodManagesAccount(request.resource.data)
+        || (request.resource.data.role == "Admin" && setupAppoints(uid));
+      // A user may also clear their own "must change password" flag and
+      // record their own recovery email.
+      allow update: if isAdmin()
+        || (hodManagesAccount(resource.data) && hodManagesAccount(request.resource.data))
         || (signedIn()
             && request.auth.uid == uid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["mustChangePassword", "recoveryEmail"])
             && request.resource.data.mustChangePassword == false
             && request.resource.data.get("recoveryEmail", "") is string);
-      allow delete: if isHod();
+      allow delete: if isAdmin() || hodManagesAccount(resource.data);
     }
 
     // Login ID -> internal sign-in address. Needed before signing in,
@@ -127,106 +207,177 @@ service cloud.firestore {
     match /loginNames/{loginId} {
       allow get: if true;
       allow list: if false;
-      allow create: if isHod()
-        || (signedIn()
-            && !hodSetupDone()
-            && getAfter(/databases/$(database)/documents/config/hod).data.uid == request.auth.uid
-            && request.resource.data.uid == request.auth.uid);
-      allow update, delete: if isHod();
+      allow create: if isAdmin()
+        || hodCreates()
+        || setupAppoints(request.resource.data.uid);
+      allow update: if isAdmin() || hodUpdates();
+      allow delete: if isAdmin() || hodDeletes();
     }
 
-    // ---------- Department setup (HOD writes, logged-in users read) ----------
+    // ---------- Department setup (HOD of the department writes, logged-in users read) ----------
     match /batches/{id} {
       allow read: if anyUser();
-      allow write: if isHod();
+      allow create: if hodCreates();
+      allow update: if hodUpdates() || claimsLegacy();
+      allow delete: if hodDeletes();
+    }
+    // A subject's batch must belong to the same department
+    function subjectBatchOk() {
+      let s = request.resource.data;
+      return get(doc("batches", string(s.batchId) + "_" + string(s.semester))).data.get("departmentId", "") == s.departmentId;
     }
     match /subjects/{id} {
       allow read: if anyUser();
-      allow write: if isHod();
+      allow create: if hodCreates() && subjectBatchOk();
+      allow update: if (hodUpdates() && subjectBatchOk()) || claimsLegacy();
+      allow delete: if hodDeletes();
     }
+    // Enrollments belong to the subject's (offering) department; they may
+    // list students of any department.
     match /enrollments/{id} {
       allow read: if anyUser();
-      allow write: if isHod();
+      allow create: if hodCreates();
+      allow update: if hodUpdates() || claimsLegacy();
+      allow delete: if hodDeletes();
+    }
+    // Only a teacher of the same department can be assigned
+    function assignmentTeacherOk() {
+      let a = request.resource.data;
+      return a.get("teacherId", null) == null
+        || get(doc("teachers", a.teacherId)).data.get("departmentId", "") == a.departmentId;
     }
     match /subjectAssignments/{id} {
       allow read: if anyUser();
-      allow write: if isHod();
+      allow create: if hodCreates() && assignmentTeacherOk();
+      allow update: if (hodUpdates() && assignmentTeacherOk()) || claimsLegacy();
+      allow delete: if hodDeletes();
     }
+
+    // Closed days: "<date>" closes the whole institution (Admin);
+    // "<departmentId>_<date>" closes one department (its HOD).
     match /dayStatuses/{id} {
       allow read: if anyUser();
-      allow write: if isHod();
+      allow create, update: if request.resource.data.date is string
+        && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && ((isAdmin() && request.resource.data.get("departmentId", "") == "ALL" && id == request.resource.data.date)
+            || (isAdmin() && id == request.resource.data.get("departmentId", "") + "_" + request.resource.data.date
+                && exists(doc("departments", request.resource.data.departmentId)))       // upgrade: old closed days
+            || (hodCreates() && id == request.resource.data.departmentId + "_" + request.resource.data.date));
+      allow delete: if isAdmin() || hodDeletes();
     }
 
     // ---------- People ----------
+    // Staff of any department may read people records: an offering
+    // department needs the names of other departments' students.
     match /teachers/{id} {
-      allow read: if isStaff();
-      allow write: if isHod();
+      allow read: if isStaff() || seesAll();
+      allow create: if hodCreates();
+      allow update: if hodUpdates() || claimsLegacy();
+      allow delete: if hodDeletes();
     }
     match /students/{id} {
-      allow read: if isStaff() || (isStudent() && me().studentDocId == id);
-      allow write: if isHod();
+      allow read: if isStaff() || seesAll() || (isStudent() && me().studentDocId == id);
+      allow create: if hodCreates();
+      allow update: if hodUpdates() || claimsLegacy();
+      allow delete: if hodDeletes();
     }
 
     // ---------- Attendance (create once, never edit) ----------
     match /attendance/{docId} {
-      allow read: if isStaff();
+      allow read: if canReadRecord();
       allow create: if teaches(request.resource.data.subjectId)
         && request.resource.data.date is string
         && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
         && docId == request.resource.data.subjectId + "_" + request.resource.data.date
         && request.resource.data.records is map
-        && classCouldMeet(request.resource.data.subjectId, request.resource.data.date);
-      allow update, delete: if false;
+        && request.resource.data.get("departmentId", "") == myDept()
+        && classCouldMeet(request.resource.data.subjectId, request.resource.data.date, myDept());
+      allow update: if claimsLegacy();
+      allow delete: if false;
+    }
+
+    // ---------- Daily class summaries (for the Principal's dashboard) ----------
+    // "<subjectId>_<date>": who taught, and how many were present / absent / on leave.
+    // Written with the attendance (teacher) or recomputed by the department's HOD;
+    // the counts must add up to the saved attendance.
+    function summaryOk(id) {
+      let s = request.resource.data;
+      let att = doc("attendance", id);
+      return s.keys().hasOnly(["departmentId", "subjectId", "date", "subjectName", "teacherId", "teacherName",
+                                "present", "absent", "leave", "markedAt"])
+        && id == s.subjectId + "_" + s.date
+        && s.present is int && s.absent is int && s.leave is int
+        && s.present >= 0 && s.absent >= 0 && s.leave >= 0
+        && existsAfter(att)
+        && getAfter(att).data.get("departmentId", "") == s.departmentId
+        && s.present + s.absent + s.leave == getAfter(att).data.records.size();
+    }
+    match /classSummaries/{id} {
+      allow read: if canReadRecord();
+      allow create: if ((teaches(request.resource.data.subjectId) && request.resource.data.departmentId == myDept())
+                        || hodCreates())
+        && summaryOk(id);
+      allow update: if hodUpdates() && summaryOk(id);
+      allow delete: if false;
     }
 
     // ---------- Each student's own copy of their attendance ----------
     // One document per student per subject: "<studentId>_<subjectId>"
-    //   { studentId, subjectId, days: {date: "Present"|"Absent"},
-    //     leaves: {date: leaveType}, corrections: {date: correctedStatus}, last }
+    //   { studentId, subjectId, departmentId (the subject's),
+    //     days: {date: "Present"|"Absent"}, leaves: {date: leaveType},
+    //     corrections: {date: correctedStatus}, last }
     // Written with the attendance itself (teacher), on approval (HOD), or
     // rebuilt from the originals by the HOD. Students read only their own.
     match /studentViews/{viewId} {
-      allow read: if isStaff() || (isStudent() && resource.data.studentId == me().studentDocId);
-      allow create: if isHod() || teacherViewWriteOk(viewId, {}, {}, {});
-      allow update: if isHod() || teacherViewWriteOk(viewId,
-                         resource.data.get("days", {}),
-                         resource.data.get("leaves", {}),
-                         resource.data.get("corrections", {}));
-      allow delete: if isHod();
+      allow read: if canReadRecord()
+        || (isStudent() && resource != null && resource.data.studentId == me().studentDocId);
+      allow create: if hodCreates() || teacherViewWriteOk(viewId, {}, {}, {});
+      allow update: if hodUpdates() || claimsLegacy()
+        || (resource.data.get("departmentId", "") == myDept()
+            && teacherViewWriteOk(viewId,
+                 resource.data.get("days", {}),
+                 resource.data.get("leaves", {}),
+                 resource.data.get("corrections", {})));
+      allow delete: if hodDeletes();
     }
 
     match /classCancellations/{docId} {
       allow read: if anyUser();
-      allow create: if (teaches(request.resource.data.subjectId) || isHod())
+      allow create: if (teaches(request.resource.data.subjectId) || hodCreates())
+        && request.resource.data.get("departmentId", "") == myDept()
         && request.resource.data.subjectId is string
         && request.resource.data.date is string
-        && docId == request.resource.data.subjectId + "_" + request.resource.data.date;
-      allow update: if false;
-      allow delete: if isHod();
+        && docId == request.resource.data.subjectId + "_" + request.resource.data.date
+        && get(doc("subjects", request.resource.data.subjectId)).data.get("departmentId", "") == myDept();
+      allow update: if claimsLegacy();
+      allow delete: if hodDeletes();
     }
 
     // ---------- Corrections ----------
     match /correctionRequests/{id} {
-      allow read: if isStaff();
+      allow read: if canReadRecord();
       allow create: if teaches(request.resource.data.subjectId)
         && request.resource.data.requestedBy == me().teacherId
-        && request.resource.data.status == "pending";
-      allow update: if isHod();
+        && request.resource.data.status == "pending"
+        && request.resource.data.get("departmentId", "") == myDept();
+      allow update: if hodUpdates() || claimsLegacy();
       allow delete: if false;
     }
     match /attendanceCorrections/{id} {
-      allow read: if isStaff();
-      allow create: if isHod();
-      allow update, delete: if false;
+      allow read: if canReadRecord();
+      allow create: if hodCreates();
+      allow update: if claimsLegacy();
+      allow delete: if false;
     }
 
     // ---------- Leave ----------
     // A teacher records leave for a student who has an entry in that day's saved
     // attendance of a subject they teach. Leaves are never edited; only the HOD removes one.
     match /leaves/{docId} {
-      allow read: if isStaff();
+      allow read: if canReadRecord();
       allow create: if teaches(request.resource.data.subjectId)
-        && request.resource.data.keys().hasOnly(["subjectId", "date", "studentId", "type", "reference", "markedBy", "markedAt"])
+        && request.resource.data.keys().hasOnly(["subjectId", "departmentId", "date", "studentId", "type", "reference", "markedBy", "markedAt"])
+        && request.resource.data.get("departmentId", "") == myDept()
         && request.resource.data.type in ["CASUAL", "MEDICAL", "NCC", "OTHER"]
         && request.resource.data.date is string
         && request.resource.data.studentId is string
@@ -234,16 +385,10 @@ service cloud.firestore {
         && request.resource.data.reference.size() <= 100
         && request.resource.data.markedBy == me().teacherId
         && docId == request.resource.data.subjectId + "_" + request.resource.data.date + "_" + request.resource.data.studentId
-        && exists(/databases/$(database)/documents/attendance/$(request.resource.data.subjectId + "_" + request.resource.data.date))
-        && request.resource.data.studentId in get(/databases/$(database)/documents/attendance/$(request.resource.data.subjectId + "_" + request.resource.data.date)).data.records;
-      allow update: if false;
-      allow delete: if isHod();
-    }
-
-    // ---------- Settings (e.g. casual leave limit) ----------
-    match /config/settings {
-      allow read: if anyUser();
-      allow write: if isHod();
+        && exists(doc("attendance", request.resource.data.subjectId + "_" + request.resource.data.date))
+        && request.resource.data.studentId in get(doc("attendance", request.resource.data.subjectId + "_" + request.resource.data.date)).data.records;
+      allow update: if claimsLegacy();
+      allow delete: if hodDeletes();
     }
 
     // Everything else is denied by default.

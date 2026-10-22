@@ -190,7 +190,10 @@
           await expectBlocked("Mark attendance for a subject not assigned to them",
                               () => db.collection("attendance").doc(PROBE + "_2000-01-01")
                                       .set({ subjectId: PROBE, date: "2000-01-01", records: {} }));
-          const existing = await db.collection("attendance").limit(1).get();
+          await expectBlocked("Read another department's attendance",
+                              () => db.collection("attendance").where("departmentId", "==", PROBE).get());
+          await expectBlocked("Read attendance of all departments", () => db.collection("attendance").get());
+          const existing = await db.collection("attendance").where("departmentId", "==", String(me.profile.departmentId || "")).limit(1).get();
           if (existing.empty) {
             addRow("Change attendance after it was saved", "blocked", "skipped", "No attendance saved yet — mark one class first to test this.");
           } else {
@@ -198,9 +201,11 @@
             await expectBlocked("Change attendance after it was saved", () => doc.ref.set(doc.data()));
             await expectBlocked("Delete saved attendance", () => doc.ref.delete());
           }
-          await expectBlocked("Create a subject", () => db.collection("subjects").doc(PROBE).set({ name: PROBE }),
+          await expectBlocked("Create a subject", () => db.collection("subjects").doc(PROBE).set({ name: PROBE, departmentId: me.profile.departmentId || "" }),
                               () => db.collection("subjects").doc(PROBE).delete());
-          await expectBlocked("Create a student", () => db.collection("students").doc(PROBE).set({ name: PROBE }),
+          await expectBlocked("Make themselves an Institution Admin", () => db.collection("users").doc(me.uid).update({ role: "Admin" }),
+                              () => db.collection("users").doc(me.uid).update({ role: "Teacher" }));
+          await expectBlocked("Create a student", () => db.collection("students").doc(PROBE).set({ name: PROBE, departmentId: me.profile.departmentId || "" }),
                               () => db.collection("students").doc(PROBE).delete());
           await expectBlocked("Approve a correction directly", () => db.collection("attendanceCorrections").doc(PROBE).set({ decision: "Approved" }));
           await expectBlocked("Change someone's login", () => db.collection("loginNames").doc(PROBE).set({ email: "x", uid: "x" }),

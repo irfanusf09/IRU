@@ -66,15 +66,17 @@
     <p id="forgotMessage" style="font-size:13px;"></p>
   </div>
 
-  <p style="margin-top:20px; font-size:13px;"><a href="#" id="setupLink" style="display:none;">First-time setup (HOD)</a></p>
+  <p style="margin-top:20px; font-size:13px;"><a href="#" id="setupLink" style="display:none;">First-time setup (Institution Admin)</a></p>
   <div id="setupPanel" style="display:none; margin-top:10px; padding:12px; border:1px solid #ddd; border-radius:6px; background:#fff;">
     <h3 style="margin-top:0;">First-time setup</h3>
-    <p style="font-size:13px; color:#555;">Create the HOD account. This can only be done once.</p>
-    <input id="setupName" placeholder="HOD name" style="display:block; width:100%; margin-bottom:8px;">
-    <input id="setupLoginId" value="hod" placeholder="Login ID (e.g. hod)" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
+    <p style="font-size:13px; color:#555;">Create the Institution Admin account. This can only be done once.
+      The Institution Admin adds departments and creates each HOD's login.</p>
+    <input id="setupInstitution" placeholder="Institution name (e.g. Amar Singh College)" style="display:block; width:100%; margin-bottom:8px;">
+    <input id="setupName" placeholder="Your name" style="display:block; width:100%; margin-bottom:8px;">
+    <input id="setupLoginId" value="admin" placeholder="Login ID (e.g. admin)" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
     <input type="password" id="setupPassword" placeholder="Password (at least 8 characters)" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
     <input type="password" id="setupPassword2" placeholder="Type the password again" autocomplete="new-password" style="display:block; width:100%; margin-bottom:8px;">
-    <button id="setupBtn" class="primary">Create HOD account</button>
+    <button id="setupBtn" class="primary">Create Institution Admin account</button>
     <p id="setupMessage" style="font-size:13px;"></p>
   </div>
 </div>
@@ -95,6 +97,8 @@
     <!-- Groups whose buttons are all hidden for a role hide their heading too (applyRoleGuards) -->
     <div class="menu-group">
       <div class="menu-heading">Daily</div>
+      <button onclick="showSection('principalSection')">🏛️ Institution Dashboard</button>
+      <button onclick="showSection('upgradeSection')">⬆️ Set up departments</button>
       <button onclick="showSection('hodDashboardSection')">🏠 HOD Dashboard</button>
       <button onclick="showSection('studentDashboardSection')">🏠 Dashboard</button>
       <button onclick="showSection('attendanceSection')">✅ Attendance</button>
@@ -115,6 +119,7 @@
 
     <div class="menu-group">
       <div class="menu-heading">Admin</div>
+      <button onclick="showSection('institutionSection')">🏫 Institution Setup</button>
       <button onclick="showSection('adminSection')">⚙️ Admin Panel</button>
       <button onclick="showSection('archiveSection')">🏛️ Archive Room</button>
       <button onclick="showSection('exitRegistrySection')">🎓 Alumni Registry</button>
@@ -425,8 +430,8 @@
   <div class="admin-tab" data-tab="logins" role="tabpanel">
 <h2>Student Logins</h2>
 <p style="font-size:13px; color:#6b7280;">
-  Each student logs in with a Login ID made from programme, batch year and roll number
-  (e.g. <b>ug2025-07</b>) and a starting password that is shown once, to print or download.
+  Each student logs in with their <b>roll number</b> as Login ID and a starting password that is
+  shown once, to print or download. (Logins created before departments keep their old ID too.)
 </p>
 <select id="studentLoginBatchSelect"></select>
 <button id="loadStudentLoginsBtn" onclick="App.Accounts.renderStudentLogins()">Show students</button>
@@ -442,9 +447,8 @@
   Casual leave is limited per subject per semester. Medical, NCC and Other leave are not limited.
   Leave days are left out of the attendance percentage.
 </p>
-<label for="casualLeaveLimitInput">Casual leaves allowed per subject per semester:</label>
-<input type="number" id="casualLeaveLimitInput" min="0" max="60" step="1" style="width:90px;">
-<button id="saveLeaveLimitBtn" onclick="App.Settings.save()">Save</button>
+<p>Casual leaves allowed per subject per semester: <b id="casualLeaveLimitShow">…</b>
+  <span style="font-size:13px; color:#6b7280;">(set by the Institution Admin for all departments)</span></p>
 
 <h2 style="margin-top:28px;">Student attendance copies</h2>
 <p style="font-size:13px; color:#6b7280;">
@@ -551,6 +555,101 @@
     <div id="exitRegistryOutput" style="margin-top:20px; background:white; min-height:100px; border:1px solid #eee;">
       </div>
   </div>
+</div>
+
+<!-- ================= INSTITUTION SETUP (Institution Admin) ================= -->
+<div id="institutionSection" class="section">
+  <h1>🏫 Institution Setup</h1>
+  <div id="instName" style="color:#6b7280; font-size:13px; margin-top:-12px;"></div>
+  <div class="admin-tabs" id="instTabs" role="tablist">
+    <button type="button" data-tab="departments" role="tab">🏢 Departments</button>
+    <button type="button" data-tab="accounts" role="tab">🔑 HOD &amp; Principal logins</button>
+    <button type="button" data-tab="closures" role="tab">🗓️ Institution closed days</button>
+    <button type="button" data-tab="settings" role="tab">⚙️ Rules</button>
+    <button type="button" data-tab="upgrade" role="tab" id="instUpgradeTab" style="display:none;">⬆️ Old records</button>
+  </div>
+
+  <div class="admin-tab" data-tab="departments" role="tabpanel">
+    <h2>Departments</h2>
+    <div id="deptList" style="overflow-x:auto;">Loading…</div>
+    <h3>Add a department</h3>
+    <input type="text" id="deptNameInput" placeholder="Department name (e.g. Physics)">
+    <label><input type="checkbox" id="deptUG" checked> UG</label>
+    <label><input type="checkbox" id="deptPG"> PG</label>
+    <label><input type="checkbox" id="deptIG"> IG</label>
+    <button id="addDeptBtn" class="primary">Add department</button>
+  </div>
+
+  <div class="admin-tab" data-tab="accounts" role="tabpanel">
+    <h2>HOD and Principal logins</h2>
+    <p style="font-size:13px; color:#6b7280;">HODs create their own teachers' and students' logins. Here you create the HODs' and the Principal's,
+      and reset their passwords.</p>
+    <div id="leaderList" style="overflow-x:auto;">Loading…</div>
+    <h3>Create a login</h3>
+    <select id="leaderRole">
+      <option value="HOD">HOD</option>
+      <option value="Principal">Principal (view only)</option>
+    </select>
+    <select id="leaderDept"></select>
+    <input type="text" id="leaderName" placeholder="Name">
+    <input type="text" id="leaderLoginId" placeholder="Login ID (e.g. hod.physics)" autocapitalize="none">
+    <button id="addLeaderBtn" class="primary">Create login</button>
+  </div>
+
+  <div class="admin-tab" data-tab="closures" role="tabpanel">
+    <h2>Days closed for the whole institution</h2>
+    <p style="font-size:13px; color:#6b7280;">No department can mark attendance on these days. HODs can also close days for their own department.</p>
+    <input type="date" id="instClosedDate">
+    <select id="instClosedType">
+      <option value="weather">Weather Issue</option>
+      <option value="admin">Administrative Closure</option>
+      <option value="emergency">Emergency</option>
+      <option value="event">Institution Event</option>
+      <option value="custom">Custom</option>
+    </select>
+    <input type="text" id="instClosedReason" placeholder="Enter reason">
+    <button id="instClosedBtn">Mark Day Closed</button>
+    <ul id="instClosedList"></ul>
+  </div>
+
+  <div class="admin-tab" data-tab="settings" role="tabpanel">
+    <h2>Rules for all departments</h2>
+    <p style="font-size:13px; color:#6b7280;">
+      Casual leave is limited per subject per semester. Medical, NCC and Other leave are not limited.
+      Leave days are left out of the attendance percentage.
+    </p>
+    <label for="casualLeaveLimitInput">Casual leaves allowed per subject per semester:</label>
+    <input type="number" id="casualLeaveLimitInput" min="0" max="60" step="1" style="width:90px;">
+    <button id="saveLeaveLimitBtn" onclick="App.Settings.save()">Save</button>
+    <p style="font-size:13px; color:#6b7280;">Minimum attendance: <b>75%</b> (all departments).</p>
+
+    <h2 style="margin-top:28px;">Backup</h2>
+    <p style="font-size:13px; color:#6b7280;">A full copy of every department's records. HODs can also download their own department's.</p>
+    <button id="instBackupExcelBtn" class="primary">Download backup (Excel)</button>
+    <button id="instBackupJsonBtn">Download exact copy (for restoring)</button>
+    <p id="instBackupStatus" style="font-size:13px;"></p>
+  </div>
+
+  <div class="admin-tab" data-tab="upgrade" role="tabpanel">
+    <h2>Records from before departments</h2>
+    <div id="upgradeOldRecords"></div>
+  </div>
+</div>
+
+<!-- ================= INSTITUTION DASHBOARD (Principal, Institution Admin) ================= -->
+<div id="principalSection" class="section">
+  <h1>🏛️ Institution Dashboard</h1>
+  <div style="display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px;">
+    <label>Date: <input type="date" id="principalDate"></label>
+    <button id="principalTodayBtn">Today</button>
+  </div>
+  <div id="principalOutput">Loading…</div>
+</div>
+
+<!-- ================= SET UP DEPARTMENTS (accounts from before departments) ================= -->
+<div id="upgradeSection" class="section">
+  <h1>⬆️ Set up departments</h1>
+  <div id="upgradeOutput">Loading…</div>
 </div>
 
 <!-- ================= END OF MAIN ================= -->
