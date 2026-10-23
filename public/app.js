@@ -397,7 +397,8 @@ App.autoLoginId = function (input, suggest) {
     if (!input.dataset.auto) return;
     const my = ++seq;
     const id = await suggest();
-    if (my === seq && input.dataset.auto) input.value = id;
+    // not while someone is in the field: their typing would be joined to it
+    if (my === seq && input.dataset.auto && document.activeElement !== input) input.value = id;
   };
 };
 
