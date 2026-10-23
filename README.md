@@ -109,7 +109,7 @@ cd tools/demo-seed && npm install && cd ../reset-login && npm install && cd ../b
 cd ../../tests/e2e
 npm install
 npx playwright install chromium     # first time only: the test browser
-npm test                            # about 10 minutes
+npm test                            # a few minutes
 ```
 
 `npm run speed` in `tests/e2e` times the main screens with a simulated distant database.
