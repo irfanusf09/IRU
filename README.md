@@ -1,10 +1,29 @@
-# Department Attendance System
+# Attendance System
 
-Attendance marking, registers and reports for a college department, with three roles:
-**HOD**, **Teacher** and **Student**. Installable on phones and computers (PWA).
+Attendance marking, registers and reports for a college — one department or many.
+Installable on phones and computers (PWA).
 
 Built with plain HTML/CSS/JavaScript on **Firebase** (Authentication, Firestore, Hosting).
 There is no build step and no server code.
+
+## Who does what
+
+| Role | Sees | Does |
+|------|------|------|
+| **Institution Admin** | Every department | Adds departments; creates HOD and Principal logins; sets institution rules (casual leave limit); closes days for the whole institution; full backup |
+| **Principal** | Every department, view only | Institution Dashboard: per day, classes held / not held / not marked, present / absent / leave, who took which class |
+| **HOD** | Their department | Batches, subjects, teachers, students and their logins, closed days, correction decisions, reports, backup |
+| **Teacher** | Their subjects | Marks attendance once per class per day, records leave, requests corrections |
+| **Student** | Their own records | Dashboard and day-by-day register for all their subjects, from any department |
+
+The database rules (`firestore.rules`) enforce this on Google's servers, not just on screen.
+
+A department can teach students of other departments (e.g. a Minor): its HOD uploads the
+roll numbers, the students are found in their home department, and the offering HOD sees
+their attendance in that subject. Roll numbers are unique in the institution; a student's
+login ID is their roll number.
+
+Running it for a single department is the same app with one department.
 
 ## Layout
 
@@ -18,6 +37,8 @@ There is no build step and no server code.
 | `public/security-check.html` | Page that checks the database rules block what they should |
 | `firestore.rules` | Database security rules (who may read/write what) |
 | `firebase.json`, `.firebaserc` | Firebase Hosting / deploy settings |
+| `tests/` | Automated tests of the database rules |
+| `tools/demo-seed/` | Fills an empty project with a sample institution, for demonstrations |
 
 ## Deploying
 
@@ -30,6 +51,25 @@ Each deploy sends hosting + Firestore rules to that project.
 
 `public/firebase-config.js` picks the project from the address the app is opened at:
 the test project's addresses and `localhost` use **test**; everything else uses **real**.
+
+## Starting
+
+**A new project:** open the site and use **First-time setup (Institution Admin)** on the
+login screen. Then, as Institution Admin: add the departments (Institution Setup →
+Departments) and create each HOD's login. Each HOD then sets up their department as before.
+
+**A project already used by one department (before departments existed):**
+
+1. Deploy, then log in as the existing HOD. You will see only **Set up departments**:
+   create the Institution Admin's login there (it is a separate login; note the password).
+2. Log out, log in as the Institution Admin, choose a new password.
+3. Institution Setup → Departments: add the department (e.g. Economics).
+4. Institution Setup → **Old records** → *Move old records into this department*.
+   Students also get their roll number as a login ID; their old IDs keep working.
+5. Log in as the HOD again → Admin Panel → Settings → **Rebuild student copies**
+   (this also fills the Principal's dashboard for past days).
+
+Until step 4 is done, the old records can't be used.
 
 ## Testing the database rules
 
@@ -44,11 +84,40 @@ npm test
 
 Run it after any change to `firestore.rules`, before deploying.
 
+## Demo for the college
+
+`tools/demo-seed/seed.mjs` fills an **empty** Firebase project with "Demo College":
+four departments, HODs, teachers, a Principal, students taking Minors from other
+departments, and three weeks of attendance (with leaves, defaulters, closed days, and
+some of today's classes not yet marked). It refuses to run on a project that already
+has data, and on the real project.
+
+1. Create a separate Firebase project for the demo (the free plan is enough); enable
+   Authentication → Email/Password; create a Firestore database; deploy the app and rules
+   to it (add it to `.firebaserc` and `public/firebase-config.js` first).
+2. Firebase console → Project settings → Service accounts → **Generate new private key**.
+   Keep that file private and outside this folder.
+3. Run:
+
+   ```sh
+   cd tools/demo-seed
+   npm install
+   node seed.mjs --key /path/to/key.json
+   ```
+
+It prints the demo logins (one shared password).
+
 ## Students' attendance copies
 
 Students may only see their own attendance. Each class's attendance is one document
 for the whole class, so each student also gets a personal copy per subject
 (collection `studentViews`), written automatically when attendance, leave or an
 approved correction is saved. The HOD can recreate all copies from the original
-records with **Admin Panel → Settings → Rebuild student copies** — needed once after
-this feature is first deployed to a project that already has attendance.
+records with **Admin Panel → Settings → Rebuild student copies**.
+
+## Institution Dashboard
+
+Each saved class also writes a small summary (`classSummaries`: who taught, present /
+absent / leave as marked). The Principal's dashboard reads only these, so it stays quick
+and cheap with many departments. Leave recorded after the class is included after the
+HOD's next **Rebuild student copies**.
