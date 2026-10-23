@@ -1,0 +1,32 @@
+// The security self-check page, run with a student and a teacher of one department.
+import { start } from "./harness.mjs";
+import { tagAll } from "./tagall.mjs";
+const h = await start();
+const { page, admin, check, log } = h;
+const SUBJ = "1700000000001", ME = 1700000000100.25;
+const uids = {};
+for (const who of ["t1", "s1"]) uids[who] = await h.signUp(`${who}@users.attendance.example.com`);
+await admin(async db => {
+  const set = (p, d) => db.doc(p).set(d);
+  await set(`users/${uids.t1}`, { role: "Teacher", name: "Asha", loginId: "t1", teacherId: "T1", active: true });
+  await set(`users/${uids.s1}`, { role: "Student", name: "One", loginId: "1001", studentId: ME, studentDocId: String(ME), roll: "1001", active: true });
+  await set("loginNames/t1", { email: "t1@users.attendance.example.com", uid: uids.t1 });
+  await set("loginNames/1001", { email: "s1@users.attendance.example.com", uid: uids.s1 });
+  await set("teachers/T1", { id: "T1", name: "Asha" });
+  await set(`students/${ME}`, { id: ME, name: "One", roll: "1001" });
+  await set(`subjectAssignments/${SUBJ}`, { subjectId: SUBJ, teacherId: "T1" });
+  await set(`attendance/${SUBJ}_2026-10-13`, { subjectId: SUBJ, date: "2026-10-13", records: { [String(ME)]: "Present" }, markedBy: "T1" });
+});
+await tagAll(admin);
+log("Security self-check page");
+await page.goto("http://localhost:5555/security-check.html");
+await page.fill("#stuId", "1001"); await page.fill("#stuPw", "secret123");
+await page.fill("#teaId", "t1"); await page.fill("#teaPw", "secret123");
+await page.click("#runBtn");
+await page.waitForSelector("#verdict", { state: "visible", timeout: 60000 });
+const verdict = await page.textContent("#verdict");
+const rows = await page.$$eval("#results tr", trs => trs.map(t => t.textContent.replace(/\s+/g, " ").trim()).filter(t => /❌|error|not tested/.test(t)));
+check("verdict: all protections working", /All tested protections are working/.test(verdict), verdict + "\n    " + rows.join("\n    "));
+const count = await page.$$eval("#results td.ok", tds => tds.length);
+check("ran the checks (≥ 25 passed)", count >= 25, String(count));
+await h.finish();

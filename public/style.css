@@ -637,3 +637,16 @@ details.dept-classes summary { cursor: pointer; }
 
 /* Changed during the edit window after saving */
 #attendanceTable tbody tr.is-changed td.status::after { content: " ✎"; color: #b45309; }
+
+/* Shown when something could not be loaded (usually no internet) */
+.load-error-bar {
+  position: fixed; left: 12px; right: 12px; bottom: 12px; z-index: 2000;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  background: #fef2f2; color: #7f1d1d; border: 1px solid #fca5a5;
+  border-radius: var(--radius); padding: 10px 12px; font-size: 14px;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12);
+}
+.load-error-bar[hidden] { display: none; }
+.load-error-bar span { flex: 1 1 220px; }
+.load-error-bar button { margin: 0; padding: 6px 12px; }
+.load-error-bar .load-error-close { background: transparent; border: none; font-size: 18px; color: inherit; }

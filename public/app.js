@@ -7,6 +7,21 @@
 // Initialize Firebase
 firebase.initializeApp(firebaseConfig);
 
+// App Check: Google only answers requests that come from this app's own web pages
+// (not from someone's script using the public settings above). Off until a site
+// key is filled in, in firebase-config.js. Every Firebase connection the app opens
+// must start it, or that connection is refused once App Check is enforced.
+function startAppCheck(app) {
+  if (typeof appCheckSiteKey === "undefined" || !appCheckSiteKey || !firebase.appCheck) return;
+  if (["localhost", "127.0.0.1"].includes(location.hostname)) return;   // can't be verified on this computer
+  try {
+    app.appCheck().activate(new firebase.appCheck.ReCaptchaV3Provider(appCheckSiteKey), true);
+  } catch (e) {
+    console.warn("App Check not started", e);
+  }
+}
+startAppCheck(firebase.app());
+
 // (Firestore will be used later)
    const db = firebase.firestore();
 
@@ -310,6 +325,23 @@ App.lib = function (name) {
   ["set", "update", "delete"].forEach(m => wrap(firebase.firestore.DocumentReference.prototype, m));
   wrap(firebase.firestore.WriteBatch.prototype, "commit");
 })();
+// Without internet, Firestore answers a list read with an empty list "from cache"
+// instead of an error, so the screen would show "no students" as if that were true.
+// Treat that as the failed read it is.
+(function noSilentOfflineLists() {
+  const orig = firebase.firestore.Query.prototype.get;
+  firebase.firestore.Query.prototype.get = function (...args) {
+    return orig.apply(this, args).then(snap => {
+      if (snap.metadata.fromCache && !(args[0] && args[0].source === "cache")) {
+        const e = new Error("The database could not be reached.");
+        e.code = "unavailable";
+        App.readFailed("List read failed (offline)", e);
+        throw e;
+      }
+      return snap;
+    });
+  };
+})();
 
 App._docs = async function (query) {
   const out = [];
@@ -411,11 +443,35 @@ App._readStudentData = async function () {
   return data;
 };
 
+// A read that failed (usually no internet). The screen would otherwise look
+// empty ("no students") as if there were nothing there, so say so instead.
+App._readErrors = 0;
+App.LOAD_FAILED = "Could not load this from the database. Check the internet connection and try again.";
+App.readFailed = function (what, e) {
+  console.warn(what, e);
+  App._readErrors++;
+  let bar = document.getElementById("loadErrorBar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "loadErrorBar";
+    bar.className = "load-error-bar";
+    bar.setAttribute("role", "alert");
+    bar.innerHTML = `<span>Some information could not be loaded, so parts of this screen may be missing.
+      Check the internet connection, then reload.</span>
+      <button type="button" class="load-error-reload">Reload</button>
+      <button type="button" class="load-error-close" aria-label="Close">×</button>`;
+    bar.querySelector(".load-error-reload").onclick = () => location.reload();
+    bar.querySelector(".load-error-close").onclick = () => { bar.hidden = true; };
+    document.body.appendChild(bar);
+  }
+  bar.hidden = false;
+};
+
 App.getTeachersFromFirestore = async function () {
   try {
     return await App.cached("teachers", () => App._docs(App.scoped("teachers")));
   } catch (e) {
-    console.warn("Teacher read failed", e);
+    App.readFailed("Teacher read failed", e);
     return [];
   }
 };
@@ -600,9 +656,11 @@ App.saveEnrollmentsToFirestore = async function(subjectId, studentIds) {
     });
 
     console.log("Enrollments saved:", subjectId);
+    return true;
 
   } catch (e) {
     console.error("Enrollment save failed:", e);
+    return false;
   }
 };
 
@@ -682,6 +740,7 @@ App.getDayStatuses = async function (deptId) {
   const q = d ? db.collection("dayStatuses").where("departmentId", "in", ["ALL", d])
               : db.collection("dayStatuses").where("departmentId", "==", "ALL");
   const map = {};
+  let ok = true;
   try {
     (await q.get()).forEach(doc => {
       const x = doc.data();
@@ -690,9 +749,10 @@ App.getDayStatuses = async function (deptId) {
       if (!map[date] || x.departmentId !== "ALL") map[date] = { ...x, docId: doc.id };
     });
   } catch (e) {
-    console.warn("Closed days read failed", e);
+    App.readFailed("Closed days read failed", e);
+    ok = false;
   }
-  App._dayCache[d] = { at: now, map };
+  if (ok) App._dayCache[d] = { at: now, map };
   return map;
 };
 
@@ -834,7 +894,7 @@ App.getSettings = async function () {
     const limit = Number(d.casualLeaveLimit), win = Number(d.editWindowMinutes);
     if (Number.isFinite(limit) && limit >= 0) value.casualLeaveLimit = limit;
     if (Number.isInteger(win) && win >= 0) value.editWindowMinutes = win;
-  } catch (e) { console.warn("settings read failed", e); }
+  } catch (e) { App.readFailed("settings read failed", e); return value; }
   App._settingsCache = { at: now, value };
   return value;
 };
@@ -1339,7 +1399,7 @@ App.Accounts = {};
 
 App.Accounts._creatorAuth = async function () {
   let app = firebase.apps.find(a => a.name === "accountCreator");
-  if (!app) app = firebase.initializeApp(firebaseConfig, "accountCreator");
+  if (!app) { app = firebase.initializeApp(firebaseConfig, "accountCreator"); startAppCheck(app); }
   const a = app.auth();
   try { await a.setPersistence(firebase.auth.Auth.Persistence.NONE); } catch (e) {}
   return a;
@@ -2751,7 +2811,7 @@ App.getStudents = async function () {
     const others = [...new Set(Object.values(enrollments).flat().map(String))].filter(id => !have.has(id));
     return own.concat(await App.getStudentsByIds(others));
   } catch (e) {
-    console.warn("Firestore student read failed", e);
+    App.readFailed("Firestore student read failed", e);
   }
   return [];
 };
@@ -2786,7 +2846,7 @@ App.getSubjects = async function () {
     if (App.role() === "Student") return (await App._studentData()).subjects;
     return await App.cached("subjects", () => App._docs(App.scoped("subjects")));
   } catch (e) {
-    console.warn("Firestore subject read failed", e);
+    App.readFailed("Firestore subject read failed", e);
   }
   return [];
 };
@@ -2802,7 +2862,7 @@ App.getEnrollments = async function () {
       return enrollments;
     });
   } catch (e) {
-    console.warn("Firestore enrollment read failed", e);
+    App.readFailed("Firestore enrollment read failed", e);
   }
   return {};
 };
@@ -2817,7 +2877,7 @@ App.getBatches = async function () {
     return batches.filter(b => b.id && b.semester && b.year && b.year !== 0);
 
   } catch (e) {
-    console.warn("Firestore batch read failed");
+    App.readFailed("Firestore batch read failed", e);
   }
 
   return [];
@@ -2951,7 +3011,7 @@ App.getClassCancellation = async function (subjectId, date) {
     if (doc.exists) return doc.data();
 
   } catch (e) {
-    console.warn("Firestore cancel read failed", e);
+    App.readFailed("Firestore cancel read failed", e);
   }
 
   return null;
@@ -2966,7 +3026,7 @@ App.getAttendanceDoc = async function (subjectId, date) {
     const doc = await db.collection("attendance").doc(`${subjectId}_${date}`).get();
     return doc.exists ? doc.data() : null;
   } catch (e) {
-    console.warn("Firestore read failed", e);
+    App.readFailed("Firestore read failed", e);
     return null;
   }
 };
@@ -2983,7 +3043,7 @@ App.getAttendance = async function (subjectId, date) {
     }
 
   } catch (e) {
-    console.warn("Firestore read failed", e);
+    App.readFailed("Firestore read failed", e);
   }
 
   // fallback to LocalStorage
@@ -3367,8 +3427,7 @@ addBatchBtn.onclick = async () => {
     year: Number(year),
     status: 'ACTIVE' 
   });
- try {
-  await App.saveBatchToFirestore({
+  const batchSaved = await App.saveBatchToFirestore({
     id: batchId,
     departmentId: App.dept(),
     program,
@@ -3376,9 +3435,10 @@ addBatchBtn.onclick = async () => {
     year: Number(year),
     status: "ACTIVE"
   });
-} catch (e) {
-  console.warn("Firestore batch mirror failed", e);
-}
+  if (!batchSaved) {
+    UI.alert("The batch could NOT be saved. Check the internet connection and try again.");
+    return;
+  }
 
 
   batchSemester.value = "";
@@ -3499,12 +3559,11 @@ if (hasAttendance) {
     program: batch.program, semester: batch.semester, year: batch.year
   };
 
+  if (!(await App.saveSubjectToFirestore(newSubject))) {
+    UI.alert("The subject could NOT be saved. Check the internet connection and try again.");
+    return;
+  }
   subjects.push(newSubject);
-  try {
-  await App.saveSubjectToFirestore(newSubject);
-} catch (e) {
-  console.warn("Firestore subject mirror failed", e);
-}
 
   // 🔁 A new subject in a synced group starts with that group's current student list
   const groupMates = App.syncGroup(newSubject, subjects, batches)
@@ -3517,8 +3576,12 @@ if (hasAttendance) {
     const pool = earlier.length ? earlier : withStudents;
     const source = pool.sort((a, b) => Number(b.semester) - Number(a.semester))[0];
     if (source) {
-      await App.saveEnrollmentsToFirestore(id, [...enrollments[String(source.id)]]);
-      console.log(`Enrollment copied from ${source.name} (Sem ${source.semester}).`);
+      if (await App.saveEnrollmentsToFirestore(id, [...enrollments[String(source.id)]])) {
+        console.log(`Enrollment copied from ${source.name} (Sem ${source.semester}).`);
+      } else {
+        UI.alert(`The subject was added, but its students could not be copied from ${source.name}. ` +
+                 `Upload its student list in Student Manager.`);
+      }
     }
   }
 
@@ -3904,8 +3967,10 @@ const teacherAssignmentList = document.getElementById("teacherAssignmentList");
     return;
   }
 
-  // 🔥 NEW: Save to Firestore
-  await App.saveSubjectAssignmentToFirestore(subjectId, teacherId);
+  if (!(await App.saveSubjectAssignmentToFirestore(subjectId, teacherId))) {
+    UI.alert("The teacher could NOT be assigned. Check the internet connection and try again.");
+    return;
+  }
 
 
   await renderTeacherAssignments();
@@ -4760,13 +4825,22 @@ html += "</tbody></table>";
     studentList.innerHTML = "<p>Loading…</p>";
     saveBar.style.display = "none";
 
-    // Everything this screen needs, read at once
-    const [subjects, batches, closed, cancellation, enrollments, students, attDoc, settings, subjData] = await Promise.all([
-      App.getSubjects(), App.getBatches(), App.isClosedDay(date, App.dept()), App.getClassCancellation(subjectId, date),
-      App.getEnrollments(), App.getStudentsIn(subjectId), App.getAttendanceDoc(subjectId, date), App.getSettings(),
-      App.loadSubjectData(subjectId)                               // corrections, leaves, casual counts
-    ]);
+    // Everything this screen needs, read at once. If any of it can't be read
+    // (no internet), show nothing: a half-loaded class could look unmarked or empty.
+    const errorsBefore = App._readErrors;
+    let loaded;
+    try {
+      loaded = await Promise.all([
+        App.getSubjects(), App.getBatches(), App.isClosedDay(date, App.dept()), App.getClassCancellation(subjectId, date),
+        App.getEnrollments(), App.getStudentsIn(subjectId), App.getAttendanceDoc(subjectId, date), App.getSettings(),
+        App.loadSubjectData(subjectId)                             // corrections, leaves, casual counts
+      ]);
+    } catch (e) {
+      console.warn("Class could not be loaded", e);
+    }
     if (stale()) return;
+    if (!loaded || App._readErrors !== errorsBefore) { showMessage(App.LOAD_FAILED); return; }
+    const [subjects, batches, closed, cancellation, enrollments, students, attDoc, settings, subjData] = loaded;
     const subject = subjects.find(s => String(s.id) === subjectId);
     if (!subject) { showMessage("Subject not found."); return; }
     const batch = batches.find(b => String(b.id) === String(subject.batchId) && String(b.semester) === String(subject.semester));
@@ -6337,7 +6411,7 @@ App.getCorrectionRequests = async function () {
   try {
     return await App.cached("correctionRequests", () => App._docs(App.scoped("correctionRequests")));
   } catch (e) {
-    console.warn("Firestore read failed", e);
+    App.readFailed("Firestore read failed", e);
     return [];
   }
 };
@@ -6346,7 +6420,7 @@ App.getAttendanceCorrections = async function () {
   try {
     return await App.cached("attendanceCorrections", () => App._docs(App.scoped("attendanceCorrections")));
   } catch (e) {
-    console.warn("Firestore read failed", e);
+    App.readFailed("Firestore read failed", e);
     return [];
   }
 };
@@ -6402,6 +6476,10 @@ const original = App._attendanceCache[key];
 
 // Approve correction (HOD)
 App.approveCorrection = async function (requestId) {
+  try { return await App._approveCorrection(requestId); }
+  catch (e) { console.warn("Approval failed", e); return false; }
+};
+App._approveCorrection = async function (requestId) {
   const user = Auth.currentUser();
   if (!user || user.role !== "HOD") return false;
 
@@ -6431,37 +6509,33 @@ const req = doc.data();
   departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
-  try {
-  await db.collection("attendanceCorrections")
-  .doc(String(correctionId))
-  .set(correction);
-   } catch (e) {
-  console.warn("Firestore correction save failed", e);
-  }
-  // The student sees the correction through their own copy
-  await App.StudentViews.setCorrection(req.studentId, req.subjectId, req.date, req.requestedStatus)
-    .catch(e => console.warn("Student copy of correction not saved", e));
-
   req.status = "approved";
   req.reviewedBy = user.username || "HOD";
   req.reviewedAt = new Date().toISOString();
+  // The correction and the request's new status are saved together, or neither is
+  const both = db.batch();
+  both.set(db.collection("attendanceCorrections").doc(String(correctionId)), correction);
+  both.update(db.collection("correctionRequests").doc(String(req.id)),
+    { status: "approved", reviewedBy: req.reviewedBy, reviewedAt: req.reviewedAt });
   try {
-  await db.collection("correctionRequests")
-    .doc(String(req.id))
-    .update({
-      status: "approved",
-      reviewedBy: req.reviewedBy,
-      reviewedAt: req.reviewedAt
-    });
-} catch (e) {
-  console.warn("Firestore request update failed", e);
-}
+    await both.commit();
+  } catch (e) {
+    console.warn("Firestore correction save failed", e);
+    return false;
+  }
+  // The student sees the correction through their own copy ("Rebuild student copies" repairs it if this fails)
+  await App.StudentViews.setCorrection(req.studentId, req.subjectId, req.date, req.requestedStatus)
+    .catch(e => console.warn("Student copy of correction not saved", e));
 
   return true;
 };
 
 // Reject correction (HOD)
 App.rejectCorrection = async function (requestId) {
+  try { return await App._rejectCorrection(requestId); }
+  catch (e) { console.warn("Rejection failed", e); return false; }
+};
+App._rejectCorrection = async function (requestId) {
   const user = Auth.currentUser();
   if (!user || user.role !== "HOD") return false;
 
@@ -6491,30 +6565,20 @@ const req = doc.data();
   departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
-  try {
-  await db.collection("attendanceCorrections")
-    .doc(String(correctionId))
-    .set(correction);
-  } catch (e) {
-  console.warn("Firestore correction save failed", e);
-  }
-  
-
-  // Mark request as rejected
+  // Mark request as rejected, together with the register entry
   req.status = "rejected";
   req.reviewedBy = user.username || "HOD";
   req.reviewedAt = new Date().toISOString();
+  const both = db.batch();
+  both.set(db.collection("attendanceCorrections").doc(String(correctionId)), correction);
+  both.update(db.collection("correctionRequests").doc(String(req.id)),
+    { status: "rejected", reviewedBy: req.reviewedBy, reviewedAt: req.reviewedAt });
   try {
-  await db.collection("correctionRequests")
-    .doc(String(req.id))
-    .update({
-      status: "rejected",
-      reviewedBy: req.reviewedBy,
-      reviewedAt: req.reviewedAt
-    });
-} catch (e) {
-  console.warn("Firestore request update failed", e);
-}
+    await both.commit();
+  } catch (e) {
+    console.warn("Firestore correction save failed", e);
+    return false;
+  }
   return true;
 };
 
