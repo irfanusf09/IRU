@@ -42,7 +42,7 @@ const firebaseConfig = TEST_HOSTS.includes(location.hostname)
 // no secret key. See README -> "App Check".
 const APP_CHECK_SITE_KEYS = {
   real: "",
-  test: ""
+  test: "6LeTVf0tAAAAAMmti4ED0HW4mCNsJDTa0pXlqjs8"
 };
 const appCheckSiteKey = TEST_HOSTS.includes(location.hostname)
   ? APP_CHECK_SITE_KEYS.test
