@@ -268,6 +268,49 @@ App.getDepartments = async function () {
   App._deptCache = { at: now, map };
   return map;
 };
+// A department's short code, used in login IDs (e.g. "phy" in hod.phy and phy.asha)
+App.suggestDeptCode = name => {
+  const words = String(name || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").split(/\s+/).filter(Boolean);
+  if (!words.length) return "dept";
+  return words.length > 1 ? words.map(w => w[0]).join("").slice(0, 5) : words[0].slice(0, 3);
+};
+App.deptCode = async function (id) {
+  const d = (await App.getDepartments())[id || App.dept()] || {};
+  return d.code || App.suggestDeptCode(d.name || id);
+};
+
+// Suggested login ID for a new account, not yet used anywhere:
+//   HOD: hod.<code>   Teacher: <code>.<first name> (then .<last name>, then a number)   Principal: principal
+App.suggestLoginId = async function (role, name, deptId) {
+  const words = String(name || "").toLowerCase()
+    .replace(/\b(dr|mr|mrs|ms|miss|prof)\b\.?/g, " ").replace(/[^a-z ]+/g, " ").split(/\s+/).filter(Boolean);
+  const code = role === "Principal" ? "" : await App.deptCode(deptId);
+  const tries = role === "HOD" ? [`hod.${code}`]
+    : role === "Principal" ? ["principal"]
+    : words.length ? [`${code}.${words[0]}`, ...(words.length > 1 ? [`${code}.${words[0]}.${words[words.length - 1]}`] : [])]
+    : [];
+  if (!tries.length) return "";
+  for (const id of tries) if (Auth.isValidLoginId(id) && !(await App.Accounts.loginIdOwner(id))) return id;
+  for (let n = 2; n < 100; n++) {
+    const id = `${tries[0]}${n}`;
+    if (!(await App.Accounts.loginIdOwner(id))) return id;
+  }
+  return "";
+};
+
+// Fill a login ID box from a name, unless the person typed their own
+App.autoLoginId = function (input, suggest) {
+  input.dataset.auto = "1";
+  input.oninput = () => { input.dataset.auto = input.value ? "" : "1"; };
+  let seq = 0;
+  return async () => {
+    if (!input.dataset.auto) return;
+    const my = ++seq;
+    const id = await suggest();
+    if (my === seq && input.dataset.auto) input.value = id;
+  };
+};
+
 App.departmentName = async function (id) {
   return ((await App.getDepartments())[id || App.dept()] || {}).name || "";
 };
@@ -651,7 +694,9 @@ App.getAttendanceDocsForSubject = async function (subjectId) {
     Object.keys(data.records || {}).forEach(k => {
       normalized[String(k)] = data.records[k];
     });
-    result[date] = { records: normalized, markedBy: data.markedBy ? String(data.markedBy) : "" };
+    const original = {};
+    Object.keys(data.originalRecords || {}).forEach(k => { original[String(k)] = data.originalRecords[k]; });
+    result[date] = { records: normalized, markedBy: data.markedBy ? String(data.markedBy) : "", original };
   });
   return result;
 };
@@ -711,22 +756,39 @@ App.initials = function (name) {
 App.LEAVE_TYPES = { CASUAL: "Casual", MEDICAL: "Medical", NCC: "NCC", OTHER: "Other" };
 App.DEFAULT_CASUAL_LIMIT = 4;
 
-App.getLeaveLimit = async function () {
+App.DEFAULT_EDIT_WINDOW = 60;   // minutes a teacher may change saved attendance (same default as the rules)
+
+// Institution settings, cached for a minute: { casualLeaveLimit, editWindowMinutes }
+App.getSettings = async function () {
   const now = Date.now();
-  if (App._leaveLimitCache && now - App._leaveLimitCache.at < 60000) return App._leaveLimitCache.value;
-  let value = App.DEFAULT_CASUAL_LIMIT;
+  if (App._settingsCache && now - App._settingsCache.at < 60000) return App._settingsCache.value;
+  const value = { casualLeaveLimit: App.DEFAULT_CASUAL_LIMIT, editWindowMinutes: App.DEFAULT_EDIT_WINDOW };
   try {
     const snap = await db.collection("config").doc("settings").get();
-    const v = snap.exists ? Number(snap.data().casualLeaveLimit) : NaN;
-    if (Number.isFinite(v) && v >= 0) value = v;
+    const d = snap.exists ? snap.data() : {};
+    const limit = Number(d.casualLeaveLimit), win = Number(d.editWindowMinutes);
+    if (Number.isFinite(limit) && limit >= 0) value.casualLeaveLimit = limit;
+    if (Number.isInteger(win) && win >= 0) value.editWindowMinutes = win;
   } catch (e) { console.warn("settings read failed", e); }
-  App._leaveLimitCache = { at: now, value };
+  App._settingsCache = { at: now, value };
   return value;
 };
+App.getLeaveLimit = async () => (await App.getSettings()).casualLeaveLimit;
 
-App.saveLeaveLimit = async function (n) {
-  await db.collection("config").doc("settings").set({ casualLeaveLimit: n }, { merge: true });
-  App._leaveLimitCache = null;
+// Until when (ms) may the teacher who saved this attendance still change it?
+// The edit window after saving, and never past midnight (India time) of that day.
+// The database rules check the same with the server's clock.
+App.editableUntil = function (doc, minutes) {
+  if (!doc || !doc.savedAt || typeof doc.savedAt.toMillis !== "function" || !minutes) return 0;
+  const saved = doc.savedAt.toMillis();
+  const ist = new Date(saved + 330 * 60000);
+  const midnight = Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) + 1110 * 60000;
+  return Math.min(saved + minutes * 60000, midnight);
+};
+
+App.saveSettings = async function (values) {
+  await db.collection("config").doc("settings").set(values, { merge: true });
+  App._settingsCache = null;
 };
 
 // Ask the teacher for leave type (+ optional reference). Returns {type, reference} or null.
@@ -985,9 +1047,11 @@ App.loadSubjectData = async function (subjectId) {
     App._getCorrectionsCached(),
     App.getLeavesFor(sid)
   ]);
-  const byDate = {}, markedByDate = {};
-  Object.keys(attDocs).forEach(d => { byDate[d] = attDocs[d].records; markedByDate[d] = attDocs[d].markedBy; });
-  return App._subjectModel(sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList);
+  const byDate = {}, markedByDate = {}, originalByDate = {};
+  Object.keys(attDocs).forEach(d => {
+    byDate[d] = attDocs[d].records; markedByDate[d] = attDocs[d].markedBy; originalByDate[d] = attDocs[d].original;
+  });
+  return App._subjectModel(sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList, originalByDate);
 };
 
 App._loadOwnSubjectData = async function (sid, me) {
@@ -1007,7 +1071,7 @@ App._loadOwnSubjectData = async function (sid, me) {
   return App._subjectModel(sid, byDate, {}, dayStatuses, cancelDocs, corrections, leaves);
 };
 
-App._subjectModel = function (sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList) {
+App._subjectModel = function (sid, byDate, markedByDate, dayStatuses, cancelDocs, allCorrections, leaveList, originalByDate = {}) {
   const leaves = {};
   leaveList.forEach(l => { leaves[l.date + "|" + String(l.studentId)] = l; });
 
@@ -1046,6 +1110,11 @@ App._subjectModel = function (sid, byDate, markedByDate, dayStatuses, cancelDocs
     },
     isCorrected(date, studentId) {
       return !!corr[date + "|" + String(studentId)];
+    },
+    // Changed by the teacher during the edit window after saving
+    isEditedByTeacher(date, studentId) {
+      const orig = (originalByDate[date] || {})[String(studentId)];
+      return orig !== undefined && App.normalizeStatus(orig) !== App.normalizeStatus((byDate[date] || {})[String(studentId)]);
     },
     effective(date, studentId) {
       if (this.closedReason(date) || this.isCancelled(date)) return null;
@@ -1525,7 +1594,7 @@ App.Archive.showRegister = async function (subject, batch) {
       return { st, t, cells: dates.map(d => {
         const v = data.effective(d, st.id);
         const mark = v === "Present" ? "P" : v === "Absent" ? "AB" : v === "Leave" ? "L" : "—";
-        return { mark, corrected: v && data.isCorrected(d, st.id) };
+        return { mark, corrected: v && data.isCorrected(d, st.id), edited: v && data.isEditedByTeacher(d, st.id) };
       }) };
     });
 
@@ -1541,7 +1610,7 @@ App.Archive.showRegister = async function (subject, batch) {
       html += `<tr><td>${i + 1}</td><td>${App.esc(st.roll)}</td><td style="text-align:left;">${App.esc(st.name)}</td>` +
         cells.map(c => {
           const bg = c.mark === "P" ? "#d4edda" : c.mark === "AB" ? "#f8d7da" : c.mark === "L" ? "#dbeafe" : "";
-          return `<td style="background:${bg}; text-align:center;">${c.mark}${c.corrected ? "*" : ""}</td>`;
+          return `<td style="background:${bg}; text-align:center;">${c.mark}${c.corrected ? "*" : ""}${c.edited ? "†" : ""}</td>`;
         }).join("") +
         `<td><b>${t.present}</b></td><td><b>${t.absent}</b></td><td><b>${t.leave}</b></td><td><b>${t.percent === null ? "—" : t.percent + "%"}</b></td></tr>`;
     });
@@ -1552,14 +1621,14 @@ App.Archive.showRegister = async function (subject, batch) {
     html += `<tr style="background:#f8fafc;"><td colspan="3" style="text-align:left;"><i>Marked by</i></td>` +
       markedRow.map(m => `<td style="font-size:10px; text-align:center;">${App.esc(m)}</td>`).join("") + `<td colspan="4"></td></tr>`;
     html += `</table></div>
-      <div style="font-size:12px; margin-top:8px;">P = Present | AB = Absent | L = Leave (not counted in %) | — = not recorded | * = corrected (approved by HOD)</div>
+      <div style="font-size:12px; margin-top:8px;">P = Present | AB = Absent | L = Leave (not counted in %) | — = not recorded | * = corrected (approved by HOD) | † = changed by the teacher soon after saving</div>
     </div>`;
     out.innerHTML = html;
 
     document.getElementById("archRegExcelBtn").onclick = () => {
       const sheet = rows.map(({ st, t, cells }) => {
         const r = { Roll: st.roll, Name: st.name };
-        dates.forEach((d, k) => { r[fmt(d)] = cells[k].mark + (cells[k].corrected ? "*" : ""); });
+        dates.forEach((d, k) => { r[fmt(d)] = cells[k].mark + (cells[k].corrected ? "*" : "") + (cells[k].edited ? "†" : ""); });
         r.Present = t.present; r.Absent = t.absent; r.Leave = t.leave; r["%"] = t.percent === null ? "" : t.percent;
         return r;
       });
@@ -1864,19 +1933,23 @@ App.LeaveRegister.render = async function () {
 // ==========================
 App.Settings = {};
 App.Settings.load = async function () {
-  const value = await App.getLeaveLimit();
-  const input = document.getElementById("casualLeaveLimitInput");     // Institution Admin edits it
-  if (input) input.value = value;
-  const show = document.getElementById("casualLeaveLimitShow");       // HODs see it
-  if (show) show.textContent = value;
+  const s = await App.getSettings();
+  // Institution Admin edits them; HODs see them
+  const set = (id, prop, v) => { const el = document.getElementById(id); if (el) el[prop] = v; };
+  set("casualLeaveLimitInput", "value", s.casualLeaveLimit);
+  set("editWindowInput", "value", s.editWindowMinutes);
+  set("casualLeaveLimitShow", "textContent", s.casualLeaveLimit);
+  set("editWindowShow", "textContent", s.editWindowMinutes ? `${s.editWindowMinutes} minutes` : "not allowed");
 };
 App.Settings.save = async function () {
-  const input = document.getElementById("casualLeaveLimitInput");
-  const n = Number(input.value);
-  if (!Number.isInteger(n) || n < 0 || n > 60) { UI.alert("Enter a whole number between 0 and 60."); return; }
+  const n = Number(document.getElementById("casualLeaveLimitInput").value);
+  const w = Number(document.getElementById("editWindowInput").value);
+  if (!Number.isInteger(n) || n < 0 || n > 60) { UI.alert("Casual leaves: enter a whole number between 0 and 60."); return; }
+  if (!Number.isInteger(w) || w < 0 || w > 180) { UI.alert("Changing saved attendance: enter whole minutes between 0 and 180."); return; }
   try {
-    await App.saveLeaveLimit(n);
-    UI.alert(`Saved. Casual leave limit is now ${n} per subject per semester.`);
+    await App.saveSettings({ casualLeaveLimit: n, editWindowMinutes: w });
+    UI.alert(`Saved.\n\nCasual leaves: ${n} per subject per semester.\n` +
+      (w ? `Teachers can change saved attendance for ${w} minutes (never past midnight).` : "Teachers can't change saved attendance; corrections go to the HOD."));
   } catch (e) {
     console.error(e);
     UI.alert("Could not save. Check your internet connection and try again.");
@@ -2003,7 +2076,9 @@ App.Backup.downloadExcel = async function () {
       "Attendance": V("attendance").flatMap(a => Object.entries(a.records || {}).map(([sid, status]) => {
         const s = subj(a.subjectId), st = stud(sid);
         return { Date: a.date, Subject: s.name || String(a.subjectId), Semester: s.semester || "", Roll: st.roll || "",
-                 Name: st.name || "", Status: status, MarkedBy: teacherName(a.markedBy), SubjectId: String(a.subjectId), StudentId: String(sid) };
+                 Name: st.name || "", Status: status,
+                 FirstMarked: a.originalRecords && a.originalRecords[sid] !== status ? a.originalRecords[sid] : "",
+                 MarkedBy: teacherName(a.markedBy), SubjectId: String(a.subjectId), StudentId: String(sid) };
       })).sort(byKeys("Date", "Subject", "Roll")),
       "Corrections": V("attendanceCorrections").map(c => {
         const st = stud(c.studentId);
@@ -2072,6 +2147,15 @@ App.Institution._tabs = function () {
 
 App.Institution.init = async function () {
   App.Institution._tabs();
+  const nameIn = document.getElementById("deptNameInput"), codeIn = document.getElementById("deptCodeInput");
+  codeIn.dataset.auto = "1";
+  codeIn.oninput = () => { codeIn.dataset.auto = codeIn.value ? "" : "1"; };
+  nameIn.oninput = () => { if (codeIn.dataset.auto) codeIn.value = App.suggestDeptCode(nameIn.value).toUpperCase(); };
+  const fillLeaderId = App.autoLoginId(document.getElementById("leaderLoginId"), () => App.suggestLoginId(
+    document.getElementById("leaderRole").value, document.getElementById("leaderName").value, document.getElementById("leaderDept").value));
+  App.Institution._fillLeaderId = fillLeaderId;
+  document.getElementById("leaderName").oninput = fillLeaderId;
+  document.getElementById("leaderDept").onchange = fillLeaderId;
   App.Closures.bind({
     date: document.getElementById("instClosedDate"), type: document.getElementById("instClosedType"),
     reason: document.getElementById("instClosedReason"), btn: document.getElementById("instClosedBtn"),
@@ -2081,6 +2165,7 @@ App.Institution.init = async function () {
   document.getElementById("addLeaderBtn").onclick = App.Institution.addLeader;
   document.getElementById("leaderRole").onchange = e => {
     document.getElementById("leaderDept").style.display = e.target.value === "HOD" ? "" : "none";
+    fillLeaderId();
   };
   document.getElementById("instBackupExcelBtn").onclick = App.Backup.downloadExcel;
   document.getElementById("instBackupJsonBtn").onclick = App.Backup.downloadJson;
@@ -2118,18 +2203,32 @@ App.Institution.renderDepartments = async function () {
     select.innerHTML = list.map(d => `<option value="${App.esc(d.id)}">${App.esc(d.name)}</option>`).join("");
     if (!list.length) { out.innerHTML = "<p>No departments yet. Add the first one below.</p>"; return; }
     out.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
-      <tr><th style="text-align:left;">Department</th><th>Programmes</th><th>HOD</th><th></th></tr>` +
+      <tr><th style="text-align:left;">Department</th><th>Code</th><th>Programmes</th><th>HOD</th><th></th></tr>` +
       list.map(d => {
         const hods = leaders.filter(u => u.role === "HOD" && u.departmentId === d.id && u.active !== false).map(u => u.name);
-        return `<tr><td style="text-align:left;">${App.esc(d.name)}</td><td>${App.esc((d.programs || []).join(", "))}</td>
+        return `<tr><td style="text-align:left;">${App.esc(d.name)}</td>
+          <td>${d.code ? App.esc(d.code.toUpperCase()) : `<i style="color:#b45309">${App.esc(App.suggestDeptCode(d.name).toUpperCase())}?</i>`}</td>
+          <td>${App.esc((d.programs || []).join(", "))}</td>
           <td>${hods.length ? App.esc(hods.join(", ")) : "<i style='color:#b45309'>none yet</i>"}</td>
-          <td><button data-rename="${App.esc(d.id)}">Rename</button> <button data-programs="${App.esc(d.id)}">Programmes</button></td></tr>`;
+          <td><button data-rename="${App.esc(d.id)}">Rename</button> <button data-code="${App.esc(d.id)}">Code</button>
+              <button data-programs="${App.esc(d.id)}">Programmes</button></td></tr>`;
       }).join("") + "</table>";
     out.querySelectorAll("button[data-rename]").forEach(b => b.onclick = async () => {
       const d = depts[b.dataset.rename];
       const name = await UI.prompt("New name for the department:", { defaultValue: d.name });
       if (!name || !name.trim()) return;
       await db.collection("departments").doc(d.id).update({ name: name.trim() });
+      App._deptCache = null;
+      App.Institution.renderDepartments();
+    });
+    out.querySelectorAll("button[data-code]").forEach(b => b.onclick = async () => {
+      const d = depts[b.dataset.code];
+      const text = await UI.prompt(`Short code for ${d.name} (2–5 letters or digits). It starts new login IDs, e.g. hod.phy, phy.asha. ` +
+        `Existing logins keep their IDs.`, { defaultValue: (d.code || App.suggestDeptCode(d.name)).toUpperCase() });
+      if (text === null) return;
+      const code = await App.Institution._checkCode(text, d.id, depts);
+      if (!code) return;
+      await db.collection("departments").doc(d.id).update({ code });
       App._deptCache = null;
       App.Institution.renderDepartments();
     });
@@ -2150,6 +2249,15 @@ App.Institution.renderDepartments = async function () {
   }
 };
 
+// A valid, unused department code, or null (after telling the Admin why)
+App.Institution._checkCode = async function (text, ownId, depts) {
+  const code = String(text || "").trim().toLowerCase();
+  if (!/^[a-z0-9]{2,5}$/.test(code)) { await UI.alert("The code must be 2 to 5 letters or digits (e.g. PHY)."); return null; }
+  const other = Object.values(depts).find(x => x.id !== ownId && (x.code || "") === code);
+  if (other) { await UI.alert(`${code.toUpperCase()} is already the code of ${other.name}.`); return null; }
+  return code;
+};
+
 App.Institution._parsePrograms = text =>
   ["UG", "PG", "IG"].filter(p => String(text).toUpperCase().split(/[^A-Z]+/).includes(p));
 
@@ -2163,18 +2271,23 @@ App.Institution.addDepartment = async function () {
   if (Object.values(depts).some(d => String(d.name).toLowerCase() === name.toLowerCase())) {
     UI.alert(`"${name}" already exists.`); return;
   }
+  const codeIn = document.getElementById("deptCodeInput");
+  const code = await App.Institution._checkCode(codeIn.value || App.suggestDeptCode(name), null, depts);
+  if (!code) return;
   // A short, permanent ID made from the name (records store it; renaming later is fine)
   const base = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 30) || "dept";
   let id = base, n = 2;
   while (depts[id] || (await db.collection("departments").doc(id).get()).exists) id = `${base}-${n++}`;
   try {
-    await db.collection("departments").doc(id).set({ name, programs, createdAt: new Date().toISOString() });
+    await db.collection("departments").doc(id).set({ name, code, programs, createdAt: new Date().toISOString() });
   } catch (e) {
     console.error(e);
     UI.alert(App.Accounts.errorText(e));
     return;
   }
   input.value = "";
+  codeIn.value = "";
+  codeIn.dataset.auto = "1";
   App._deptCache = null;
   await App.Institution.renderDepartments();
   const upgrading = document.getElementById("instUpgradeTab").style.display !== "none";
@@ -2236,6 +2349,7 @@ App.Institution.addLeader = async function () {
     await App.Accounts.issueLogin({ loginId, password, profile: { role, name, departmentId } });
     document.getElementById("leaderName").value = "";
     document.getElementById("leaderLoginId").value = "";
+    document.getElementById("leaderLoginId").dataset.auto = "1";
     await UI.alert(`Login ready for ${name} (${role}).\n\nLogin ID: ${loginId}\nStarting password: ${password}\n\n` +
       `Give these to them. They will choose their own password at first login.`);
   } catch (e) {
@@ -2747,6 +2861,18 @@ App.getClassCancellation = async function (subjectId, date) {
 };
 
 
+
+App.clockTime = ms => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+App.getAttendanceDoc = async function (subjectId, date) {
+  try {
+    const doc = await db.collection("attendance").doc(`${subjectId}_${date}`).get();
+    return doc.exists ? doc.data() : null;
+  } catch (e) {
+    console.warn("Firestore read failed", e);
+    return null;
+  }
+};
 
 App.getAttendance = async function (subjectId, date) {
 
@@ -3457,13 +3583,15 @@ if (hasAttendance) {
 // Manual Add Teacher
 // ==========================
 
+  teacherNameInput.oninput = App.autoLoginId(teacherUsernameInput, () => App.suggestLoginId("Teacher", teacherNameInput.value));
+
   addTeacherBtn.onclick = async () => {
   const name = teacherNameInput.value.trim();
-  const username = Auth.normalizeLoginId(teacherUsernameInput.value);
+  const username = Auth.normalizeLoginId(teacherUsernameInput.value) || await App.suggestLoginId("Teacher", name);
   const password = teacherPasswordInput.value.trim();
 
   if (!name || !username || !password) {
-    UI.alert("Fill all teacher fields");
+    UI.alert("Enter the teacher's name and a starting password");
     return;
   }
   if (!Auth.isValidLoginId(username)) {
@@ -3495,6 +3623,7 @@ if (hasAttendance) {
           `They will choose their own password at first login.`);
     teacherNameInput.value = "";
     teacherUsernameInput.value = "";
+    teacherUsernameInput.dataset.auto = "1";
     teacherPasswordInput.value = "";
   } catch (e) {
     console.error(e);
@@ -3532,14 +3661,17 @@ if (uploadTeacherExcelBtn) {
 
       for (const row of rows) {
         const name = String(row.Name || row.name || row.NAME || "").trim();
-        const uname = Auth.normalizeLoginId(row.Username || row.username || row.USERNAME || "");
+        let uname = Auth.normalizeLoginId(row.Username || row.username || row.USERNAME || "");
         let password = String(row.Password || row.password || row.PASSWORD || "").trim();
-        if (!name || !uname) continue;
+        if (!name) continue;
+        const ownId = !uname;
+        if (ownId) uname = await App.suggestLoginId("Teacher", name);      // no Username column: suggested ID
 
         if (!Auth.isValidLoginId(uname)) { problems.push(`${name}: username "${uname}" not allowed`); continue; }
         if (teachers.find(t => Auth.normalizeLoginId(t.username) === uname) ||
             await App.Accounts.loginIdOwner(uname)) { problems.push(`${name}: username ${uname} already exists`); continue; }
         if (password.length < 6) { password = Auth.generatePassword(); generated.push(`${name} — ${uname} — ${password}`); }
+        else if (ownId) generated.push(`${name} — ${uname} (their password from the file)`);
 
         teacherUploadStatus.textContent = `Adding ${name}…`;
         try {
@@ -3564,7 +3696,7 @@ if (uploadTeacherExcelBtn) {
 
       teacherUploadStatus.textContent =
         `Added ${added} teacher(s) with logins.` +
-        (generated.length ? ` Passwords were generated for: ${generated.join("; ")}.` : "") +
+        (generated.length ? ` Login details: ${generated.join("; ")}.` : "") +
         (problems.length ? ` Not added: ${problems.join("; ")}.` : "");
     };
 
@@ -4434,6 +4566,8 @@ html += "</tbody></table>";
   const isTeacher = !!user && user.role === "Teacher";
   let uiLoaded = false;   // Save works only after a class list was shown
   let loadSeq = 0;        // only the latest load may draw (subject/date can change quickly)
+  let editState = null;   // saved class still within its edit window
+  let lockTimer = null;   // redraws the screen when the edit window ends
 
   // Reset the screen each time it opens
   dateInput.value = "";
@@ -4536,12 +4670,13 @@ html += "</tbody></table>";
     if (stale()) return;
     if (cancellation) { showMessage("Class not held."); return; }
 
-    const [enrollments, students, record] = await Promise.all([
-      App.getEnrollments(), App.getStudents(), App.getAttendance(subjectId, date)
+    const [enrollments, students, attDoc, settings] = await Promise.all([
+      App.getEnrollments(), App.getStudents(), App.getAttendanceDoc(subjectId, date), App.getSettings()
     ]);
+    const record = attDoc ? attDoc.records || {} : {};
     App.clearAttendanceCaches();
     const subjData = await App.loadSubjectData(subjectId);     // corrections, leaves, casual counts
-    const leaveLimit = await App.getLeaveLimit();
+    const leaveLimit = settings.casualLeaveLimit;
     if (stale()) return;
 
     const ids = (enrollments[String(subjectId)] || [])
@@ -4551,6 +4686,34 @@ html += "</tbody></table>";
       .sort(App.sortByRoll);     // 1, 2, … 10 (same order as the register)
     const saved = Object.keys(record || {}).length > 0;
     const marking = isTeacher && !saved;
+    // The teacher who saved may still change marks for a while (edit window)
+    const until = saved && isTeacher && attDoc.markedBy === String(user.id) ? App.editableUntil(attDoc, settings.editWindowMinutes) : 0;
+    const editing = until > Date.now();
+    const original = (attDoc && (attDoc.originalRecords || attDoc.records)) || {};
+    editState = editing ? { attDoc, subjData, subjectId, date, until } : null;
+
+    // Absent after saving? The approved leave form can be recorded now.
+    const markLeaveButton = st => {
+      const lbtn = document.createElement("button");
+      lbtn.textContent = "Mark Leave";
+      lbtn.onclick = async e => {
+        e.stopPropagation();
+        if (editing && !saveBtn.disabled) { await UI.alert("Save your changes first, then record the leave."); return; }
+        const lv = await App.askLeaveDetails(st.name, subjData.casualUsed(st.id), leaveLimit);
+        if (!lv) return;
+        try {
+          await App.saveLeave({ subjectId, date, studentId: st.id, type: lv.type, reference: lv.reference });
+          await UI.alert(`Leave (${App.LEAVE_TYPES[lv.type]}) recorded for ${st.name} on ${date}.`);
+        } catch (err) {
+          console.error(err);
+          await UI.alert("Leave could NOT be saved. Check your internet connection and try again.");
+        }
+        await loadStudents();
+      };
+      return lbtn;
+    };
+    clearTimeout(lockTimer);
+    if (editing) lockTimer = setTimeout(() => { if (my === loadSeq) loadStudents(); }, Math.min(until - Date.now() + 1000, 2 ** 31 - 1));
     uiLoaded = true;
 
     // Rarely needed, so kept quiet; only before attendance is saved
@@ -4574,7 +4737,7 @@ html += "</tbody></table>";
           <button type="button" id="allAbsentBtn">All absent</button>
           <span class="attendance-hint">Tap a student to mark absent; tap again to undo.</span>
         </div>` : ""}
-      <table id="attendanceTable" class="${marking ? "marking" : ""}" border="1" cellpadding="6"
+      <table id="attendanceTable" class="${marking || editing ? "marking" : ""}" border="1" cellpadding="6"
         style="border-collapse:collapse;width:100%;">
         <thead style="background:#eee;">
           <tr><th>S.No</th><th>Roll</th><th>Name</th><th>Status</th><th>Action</th></tr>
@@ -4618,25 +4781,19 @@ html += "</tbody></table>";
           updateCount();
         };
         action.appendChild(lbtn);
+      } else if (editing && hasEntry) {
+        // Within the edit window: tap the row to change it; changed rows are marked ✎
+        tr.dataset.original = App.normalizeStatus(original[String(st.id)]) || "";
+        tr.onclick = () => {
+          setStatus(tr, tr.dataset.status === "Present" ? "Absent" : "Present");
+          markChanged(tr);
+          updateCount();
+        };
+        markChanged(tr);
+        if (tr.dataset.status === "Absent") action.appendChild(markLeaveButton(st));
       } else if (hasEntry && isTeacher) {
         // Absent after saving? The approved leave form can be recorded now.
-        if (tr.dataset.status === "Absent") {
-          const lbtn = document.createElement("button");
-          lbtn.textContent = "Mark Leave";
-          lbtn.onclick = async () => {
-            const lv = await App.askLeaveDetails(st.name, subjData.casualUsed(st.id), leaveLimit);
-            if (!lv) return;
-            try {
-              await App.saveLeave({ subjectId, date, studentId: st.id, type: lv.type, reference: lv.reference });
-              await UI.alert(`Leave (${App.LEAVE_TYPES[lv.type]}) recorded for ${st.name} on ${date}.`);
-            } catch (e) {
-              console.error(e);
-              await UI.alert("Leave could NOT be saved. Check your internet connection and try again.");
-            }
-            await loadStudents();
-          };
-          action.appendChild(lbtn);
-        }
+        if (tr.dataset.status === "Absent") action.appendChild(markLeaveButton(st));
         const btn = document.createElement("button");
         btn.textContent = "Request Correction";
         btn.onclick = async () => {
@@ -4664,14 +4821,75 @@ html += "</tbody></table>";
     if (allP) allP.onclick = () => setAll("Present");
     if (allA) allA.onclick = () => setAll("Absent");
 
-    // Bottom bar: counts + Save (teacher, not yet saved) / saved note / HOD view-only
+    // Bottom bar: counts + Save (teacher, not yet saved) / Save changes (edit window) / saved note / HOD view-only
     updateCount();
     saveBar.classList.toggle("saved", saved);
-    saveBtn.style.display = marking ? "" : "none";
-    saveBtn.disabled = !marking;
+    saveBtn.textContent = editing ? "Save changes" : "Save Attendance";
+    saveBtn.style.display = marking || editing ? "" : "none";
+    saveBtn.disabled = !marking;                       // "Save changes" is enabled once something changes
+    saveBtn.onclick = editing ? saveEdits : saveAttendance;
     if (viewOnlyBtn) viewOnlyBtn.style.display = user && user.role === "HOD" ? "inline-block" : "none";
-    if (saved && isTeacher) saveStatus.textContent = "✅ Saved. Changes go through Request Correction.";
+    if (editing) saveStatus.textContent = `✅ Saved. Tap a student to change their mark until ${App.clockTime(until)}.`;
+    else if (saved && isTeacher) saveStatus.textContent = "✅ Saved. Changes go through Request Correction.";
     saveBar.style.display = "";
+  }
+
+  function markChanged(tr) {
+    const now = tr.dataset.status === "Leave" ? "Absent" : tr.dataset.status;
+    tr.classList.toggle("is-changed", !!tr.dataset.original && now !== tr.dataset.original);
+    const rows = [...studentList.querySelectorAll("#attendanceTable tbody tr")];
+    const changed = editState && rows.some(r => r.dataset.original &&
+      (r.dataset.status === "Leave" ? "Absent" : r.dataset.status) !== App.normalizeStatus(editState.attDoc.records[r.dataset.studentId]));
+    saveBtn.disabled = !changed;
+  }
+
+  // --------------------------
+  // Save changes within the edit window
+  // --------------------------
+  async function saveEdits() {
+    if (!editState) return;
+    const { attDoc, subjData, subjectId, date, until } = editState;
+    const records = { ...attDoc.records };
+    studentList.querySelectorAll("#attendanceTable tbody tr").forEach(tr => {
+      const sid = tr.dataset.studentId;
+      if (records[sid] === undefined) return;          // only students in the saved record
+      records[sid] = tr.dataset.status === "Leave" ? "Absent" : tr.dataset.status;
+    });
+    const changed = Object.keys(records).filter(k => App.normalizeStatus(records[k]) !== App.normalizeStatus(attDoc.records[k]));
+    if (!changed.length) return;
+
+    const values = Object.entries(records);
+    const present = values.filter(([, v]) => v === "Present").length;
+    const leave = values.filter(([sid, v]) => v !== "Present" && subjData.leaveOf(date, sid)).length;
+    const id = `${subjectId}_${date}`;
+    const summaryRef = db.collection("classSummaries").doc(id);
+    saveBtn.disabled = true;
+    saveStatus.textContent = "Saving…";
+    try {
+      const old = await summaryRef.get();
+      const batch = db.batch();
+      batch.update(db.collection("attendance").doc(id), {
+        records,
+        originalRecords: attDoc.originalRecords || attDoc.records,
+        editedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        editedBy: String(user.id)
+      });
+      changed.forEach(sid => {
+        const c = App.StudentViews.dayWrite(sid, subjectId, date, records[sid]);
+        batch.set(c.ref, c.data, { merge: true });
+      });
+      if (old.exists) batch.set(summaryRef, { ...old.data(), present, leave, absent: values.length - present - leave });
+      await batch.commit();
+    } catch (e) {
+      console.error(e);
+      await UI.alert(Date.now() > until
+        ? `The time to change this class ended at ${App.clockTime(until)}. Use Request Correction to ask the HOD.`
+        : "Changes were NOT saved. Check your internet connection and try again.");
+      await loadStudents();
+      return;
+    }
+    await UI.alert(`Changes saved (${changed.length} student${changed.length === 1 ? "" : "s"}).\n` + countBox.textContent);
+    await loadStudents();
   }
 
   // --------------------------
@@ -4695,7 +4913,8 @@ html += "</tbody></table>";
       records: records,
       timestamp: Date.now(),
       markedBy: String(Auth.currentUser().id || ""),
-      markedAt: new Date().toISOString()
+      markedAt: new Date().toISOString(),
+      savedAt: firebase.firestore.FieldValue.serverTimestamp()   // starts the edit window (server's clock)
     };
 
     // Counts for the Principal's dashboard (leaves are recorded as Absent plus a leave record)
@@ -5124,7 +5343,7 @@ const teacherHistoryLine = App.teacherHistoryText((await App.getAssignmentHistor
   dates.forEach(d => html += `<th>${d.slice(8, 10)}</th>`);
   html += `<th>P</th><th>AB</th><th>L</th><th>%</th></tr>`;
 
-  let anyCorrected = false, anyLeave = false;
+  let anyCorrected = false, anyLeave = false, anyEdited = false;
 
   students.forEach((st, index) => {
     const isCurrent = currentIds.includes(String(st.id));
@@ -5144,8 +5363,10 @@ const teacherHistoryLine = App.teacherHistoryText((await App.getAssignmentHistor
         cell = "CL"; bg = "#fff3cd";
       } else {
         const att = data.effective(date, st.id);
-        const mark = data.isCorrected(date, st.id) ? "*" : "";
-        if (mark) anyCorrected = true;
+        const corrected = data.isCorrected(date, st.id), edited = data.isEditedByTeacher(date, st.id);
+        const mark = (corrected ? "*" : "") + (edited ? "†" : "");
+        if (corrected) anyCorrected = true;
+        if (edited) anyEdited = true;
         if (att === "Present") { cell = "P" + mark; bg = "#d4edda"; }
         else if (att === "Absent") { cell = "AB" + mark; bg = "#f8d7da"; }
         else if (att === "Leave") {
@@ -5184,6 +5405,7 @@ const teacherHistoryLine = App.teacherHistoryText((await App.getAssignmentHistor
       CL = Class Not Held
       ${anyLeave ? "&nbsp;|&nbsp; L = Leave (not counted in %; hover to see the type)" : ""}
       ${anyCorrected ? "&nbsp;|&nbsp; * = corrected (approved by HOD)" : ""}
+      ${anyEdited ? "&nbsp;|&nbsp; † = changed by the teacher soon after saving" : ""}
       ${Object.keys(markers).length ? "<br><b>Marked by:</b> " + Object.entries(markers).map(([k, v]) => `${App.esc(k)} = ${App.esc(v)}`).join(" &nbsp;|&nbsp; ") : ""}
     </div>
   `;

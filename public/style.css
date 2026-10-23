@@ -634,3 +634,6 @@ button.quiet-danger:hover { background: #fef2f2; }
 .stat span { font-size: 12px; color: var(--muted); }
 details.dept-classes { margin: 6px 0; padding: 6px 10px; background: #fff; border: 1px solid var(--border); border-radius: var(--radius); }
 details.dept-classes summary { cursor: pointer; }
+
+/* Changed during the edit window after saving */
+#attendanceTable tbody tr.is-changed td.status::after { content: " ✎"; color: #b45309; }

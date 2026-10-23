@@ -77,16 +77,16 @@ put("config/institution", { adminUid, name: "Demo College", createdAt: now });
 put("config/settings", { casualLeaveLimit: 4 });
 
 const DEPTS = [
-  { id: "economics", name: "Economics", programs: ["UG"], rollBase: 25001, minorFor: "commerce",
+  { id: "economics", code: "eco", name: "Economics", programs: ["UG"], rollBase: 25001, minorFor: "commerce",
     subjects: [["Microeconomics", "MAJOR"], ["Indian Economy", "CORE"], ["Economics for Everyone", "MINOR"]],
     teachers: ["Dr Asifa Bhat", "Mr Tariq Mir", "Ms Nida Shah"] },
-  { id: "physics", name: "Physics", programs: ["UG", "PG"], rollBase: 26001, minorFor: "economics",
+  { id: "physics", code: "phy", name: "Physics", programs: ["UG", "PG"], rollBase: 26001, minorFor: "economics",
     subjects: [["Mechanics", "MAJOR"], ["Mathematical Physics", "CORE"], ["Physics for Economists", "MINOR"]],
     teachers: ["Dr Ravi Kaul", "Ms Saima Wani", "Mr Imran Dar"] },
-  { id: "chemistry", name: "Chemistry", programs: ["UG"], rollBase: 27001, minorFor: "physics",
+  { id: "chemistry", code: "chem", name: "Chemistry", programs: ["UG"], rollBase: 27001, minorFor: "physics",
     subjects: [["Organic Chemistry", "MAJOR"], ["Physical Chemistry", "CORE"], ["Everyday Chemistry", "MINOR"]],
     teachers: ["Dr Mehraj Lone", "Ms Rubeena Khan", "Mr Faisal Qadri"] },
-  { id: "commerce", name: "Commerce", programs: ["UG", "IG"], rollBase: 28001, minorFor: "chemistry",
+  { id: "commerce", code: "com", name: "Commerce", programs: ["UG", "IG"], rollBase: 28001, minorFor: "chemistry",
     subjects: [["Financial Accounting", "MAJOR"], ["Business Law", "CORE"], ["Personal Finance", "MINOR"]],
     teachers: ["Dr Sameer Raina", "Ms Uzma Hamid", "Mr Owais Malik"] }
 ];
@@ -100,8 +100,8 @@ let idCounter = 0;
 const newId = () => 1760000000000 + (++idCounter) * 1000;
 
 for (const d of DEPTS) {
-  put(`departments/${d.id}`, { name: d.name, programs: d.programs, createdAt: now });
-  await login(`hod.${d.id}`, "HOD", `HOD ${d.name}`, { departmentId: d.id });
+  put(`departments/${d.id}`, { name: d.name, code: d.code, programs: d.programs, createdAt: now });
+  await login(`hod.${d.code}`, "HOD", `HOD ${d.name}`, { departmentId: d.id });
 
   const batchId = newId();
   put(`batches/${batchId}_3`, { id: batchId, program: "UG", year: 2025, semester: "3", status: "ACTIVE", departmentId: d.id,
@@ -110,7 +110,7 @@ for (const d of DEPTS) {
   const teacherIds = [];
   for (const [i, tName] of d.teachers.entries()) {
     const teacherId = `demo-${d.id}-t${i + 1}`;
-    const loginId = `${d.id.slice(0, 4)}.t${i + 1}`;
+    const loginId = `${d.code}.${tName.replace(/^(Dr|Mr|Ms|Mrs) /, "").split(" ")[0].toLowerCase()}`;   // as the app suggests
     const uid = await login(loginId, "Teacher", tName, { teacherId, departmentId: d.id });
     put(`teachers/${teacherId}`, { id: teacherId, name: tName, username: loginId, loginId, uid, departmentId: d.id, status: "ACTIVE" });
     teacherIds.push({ teacherId, tName });

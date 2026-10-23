@@ -26,8 +26,10 @@ rules_version = '2';
 //              attendance copies (studentViews), plus class-level data.
 //   Anyone not logged in: can only look up a login ID (to sign in).
 //
-// Saved attendance can never be edited or deleted through the app.
-// Changes go through correction requests approved by the HOD.
+// Saved attendance can never be deleted. The teacher who saved it may change
+// the marks for a short time (Institution Admin's setting, default 60 minutes,
+// never past midnight); the first-saved marks are kept, so every change shows.
+// After that, changes go through correction requests approved by the HOD.
 //
 // Upgrading a single-department install: the existing HOD appoints the
 // Institution Admin once (config/institution); the Admin then tags the
@@ -282,7 +284,29 @@ service cloud.firestore {
       allow delete: if hodDeletes();
     }
 
-    // ---------- Attendance (create once, never edit) ----------
+    // ---------- Attendance (create once; short edit window for its teacher) ----------
+    function editWindowMinutes() {
+      return exists(doc("config", "settings"))
+        ? get(doc("config", "settings")).data.get("editWindowMinutes", 60)
+        : 60;
+    }
+    function teacherEditOk() {
+      let before = resource.data;
+      let after = request.resource.data;
+      let ist = before.savedAt + duration.value(330, "m");
+      let midnight = timestamp.date(ist.year(), ist.month(), ist.day()) + duration.value(1110, "m");   // 24:00 India time
+      return before.get("savedAt", null) is timestamp
+        && teaches(before.subjectId)
+        && before.markedBy == me().teacherId
+        && request.time < before.savedAt + duration.value(editWindowMinutes(), "m")
+        && request.time < midnight
+        && after.diff(before).affectedKeys().hasOnly(["records", "originalRecords", "editedAt", "editedBy"])
+        && after.records.keys().hasOnly(before.records.keys())             // same students,
+        && before.records.keys().hasOnly(after.records.keys())             // only their marks change
+        && after.originalRecords == before.get("originalRecords", before.records)   // first-saved marks kept
+        && after.editedAt == request.time
+        && after.editedBy == me().teacherId;
+    }
     match /attendance/{docId} {
       allow read: if canReadRecord();
       allow create: if teaches(request.resource.data.subjectId)
@@ -291,8 +315,10 @@ service cloud.firestore {
         && docId == request.resource.data.subjectId + "_" + request.resource.data.date
         && request.resource.data.records is map
         && request.resource.data.get("departmentId", "") == myDept()
+        && request.resource.data.get("savedAt", null) == request.time
+        && !("originalRecords" in request.resource.data)
         && classCouldMeet(request.resource.data.subjectId, request.resource.data.date, myDept());
-      allow update: if claimsLegacy();
+      allow update: if claimsLegacy() || teacherEditOk();
       allow delete: if false;
     }
 
@@ -317,7 +343,12 @@ service cloud.firestore {
       allow create: if ((teaches(request.resource.data.subjectId) && request.resource.data.departmentId == myDept())
                         || hodCreates())
         && summaryOk(id);
-      allow update: if hodUpdates() && summaryOk(id);
+      // the HOD recomputes; the teacher updates it together with an edit of the attendance
+      allow update: if (hodUpdates()
+                        || (teaches(request.resource.data.subjectId)
+                            && resource.data.departmentId == myDept() && request.resource.data.departmentId == myDept()
+                            && getAfter(doc("attendance", id)).data.get("editedAt", null) == request.time))
+        && summaryOk(id);
       allow delete: if false;
     }
 
