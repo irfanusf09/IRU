@@ -253,6 +253,64 @@ App.scoped = function (collection, deptId) {
   if (deptId) return q.where("departmentId", "==", String(deptId));
   return App.seesAll() ? q : q.where("departmentId", "==", App.dept());
 };
+// ==========================
+// Short-lived read cache
+//   A screen needs the same lists (subjects, batches, teachers …) in several
+//   places. While a screen opens, each list is read once and shared. Opening
+//   a screen and every save clear the cache, so nothing shown is older than
+//   the screen itself. Callers get their own copy and may change it freely.
+// ==========================
+App._cache = {};
+App.cached = function (key, loader) {
+  if (!App._cache[key]) {
+    const promise = loader();
+    App._cache[key] = promise;
+    promise.catch(() => { if (App._cache[key] === promise) delete App._cache[key]; });
+  }
+  return App._cache[key].then(v => (typeof structuredClone === "function" ? structuredClone(v) : JSON.parse(JSON.stringify(v))));
+};
+App.clearReadCache = () => { App._cache = {}; };
+
+// Excel and PDF code is large, so it is fetched only when someone first uploads,
+// exports or prints. Resolves true when ready; tells the user and resolves false if not.
+App._libs = {};
+App.LIB_URLS = {
+  xlsx: "https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js",
+  pdf: "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"
+};
+App.lib = function (name) {
+  const ready = () => (name === "xlsx" ? typeof XLSX !== "undefined" : typeof html2pdf !== "undefined");
+  if (ready()) return Promise.resolve(true);
+  if (!App._libs[name]) {
+    App._libs[name] = new Promise(resolve => {
+      const s = document.createElement("script");
+      s.src = App.LIB_URLS[name];
+      s.onload = () => resolve(true);
+      s.onerror = () => { s.remove(); delete App._libs[name]; resolve(false); };
+      document.head.appendChild(s);
+    });
+  }
+  return App._libs[name].then(ok => {
+    if (!ok || !ready()) {
+      UI.alert(`Could not load the ${name === "xlsx" ? "Excel" : "PDF"} tool. Check the internet connection and try again.`);
+      return false;
+    }
+    return true;
+  });
+};
+(function clearOnEverySave() {
+  const wrap = (proto, name) => {
+    const orig = proto[name];
+    proto[name] = function (...args) {
+      App.clearReadCache();
+      const result = orig.apply(this, args);
+      return result && typeof result.finally === "function" ? result.finally(App.clearReadCache) : result;
+    };
+  };
+  ["set", "update", "delete"].forEach(m => wrap(firebase.firestore.DocumentReference.prototype, m));
+  wrap(firebase.firestore.WriteBatch.prototype, "commit");
+})();
+
 App._docs = async function (query) {
   const out = [];
   (await query.get()).forEach(d => out.push(d.data()));
@@ -325,9 +383,17 @@ App.institutionName = async function () {
 // A student's own subjects (from any department) and their batches.
 // Students may not list everything, and with thousands of students it
 // would be costly, so only their enrollments are read.
-App._studentData = async function () {
+App._studentData = function () {
+  if (App._stuCache && Date.now() - App._stuCache.at < 20000) return Promise.resolve(App._stuCache);
+  if (!App._stuLoading) {
+    const p = App._readStudentData();
+    App._stuLoading = p;
+    p.then(() => {}, () => {}).then(() => { if (App._stuLoading === p) App._stuLoading = null; });
+  }
+  return App._stuLoading;
+};
+App._readStudentData = async function () {
   const now = Date.now();
-  if (App._stuCache && now - App._stuCache.at < 20000) return App._stuCache;
   const user = Auth.currentUser() || {};
   const keys = [...new Set([Number(user.studentId), String(user.studentId)])].filter(k => k === k && k !== "undefined");
   const enrollments = {};
@@ -340,13 +406,14 @@ App._studentData = async function () {
   const batchIds = [...new Set(subjects.map(s => `${s.batchId}_${s.semester}`))];
   const batches = (await Promise.all(batchIds.map(id => db.collection("batches").doc(id).get())))
     .filter(b => b.exists).map(b => b.data());
-  App._stuCache = { at: now, enrollments, subjects, batches };
-  return App._stuCache;
+  const data = { at: now, enrollments, subjects, batches };
+  if (App._stuLoading) App._stuCache = data;   // not if the cache was cleared meanwhile
+  return data;
 };
 
 App.getTeachersFromFirestore = async function () {
   try {
-    return await App._docs(App.scoped("teachers"));
+    return await App.cached("teachers", () => App._docs(App.scoped("teachers")));
   } catch (e) {
     console.warn("Teacher read failed", e);
     return [];
@@ -584,13 +651,12 @@ App.saveSubjectAssignmentToFirestore = async function(subjectId, teacherId) {
 };
 
 // Load all assignments
+App._assignmentDocs = () => App.cached("assignments", () => App._docs(App.scoped("subjectAssignments")));
+
 App.getSubjectAssignmentsFromFirestore = async function() {
   try {
-    const snapshot = await App.scoped("subjectAssignments").get();
     const map = {};
-
-    snapshot.forEach(doc => {
-      const data = doc.data();
+    (await App._assignmentDocs()).forEach(data => {
       if (data.teacherId) map[String(data.subjectId)] = String(data.teacherId);
     });
 
@@ -721,9 +787,8 @@ App.removeSubjectAssignmentFromFirestore = async function (subjectId) {
 
 // { subjectId: [ {teacherId, from, to}, ... ] }
 App.getAssignmentHistories = async function () {
-  const snapshot = await App.scoped("subjectAssignments").get();
   const out = {};
-  snapshot.forEach(doc => { out[String(doc.data().subjectId || doc.id)] = App._historyOf(doc.data()); });
+  (await App._assignmentDocs()).forEach(data => { out[String(data.subjectId)] = App._historyOf(data); });
   return out;
 };
 
@@ -850,12 +915,19 @@ App.StudentViews.dayWrite = (studentId, subjectId, date, status) => ({
 App.StudentViews.mine = async function () {
   const now = Date.now();
   if (App._viewsCache && now - App._viewsCache.at < 20000) return App._viewsCache.map;
-  const user = Auth.currentUser() || {};
-  const snap = await db.collection("studentViews").where("studentId", "==", String(user.studentDocId)).get();
-  const map = {};
-  snap.forEach(doc => { map[String(doc.data().subjectId)] = doc.data(); });
-  App._viewsCache = { at: now, map };
-  return map;
+  // one read even when several subjects ask at once
+  if (!App._viewsLoading) {
+    const user = Auth.currentUser() || {};
+    const p = db.collection("studentViews").where("studentId", "==", String(user.studentDocId)).get().then(snap => {
+      const map = {};
+      snap.forEach(doc => { map[String(doc.data().subjectId)] = doc.data(); });
+      if (App._viewsLoading === p) App._viewsCache = { at: now, map };
+      return map;
+    });
+    App._viewsLoading = p;
+    p.then(() => {}, () => {}).then(() => { if (App._viewsLoading === p) App._viewsLoading = null; });
+  }
+  return App._viewsLoading;
 };
 
 App.StudentViews.setCorrection = function (studentId, subjectId, date, status) {
@@ -1018,16 +1090,14 @@ App.isSundayDate = function (date) {
 };
 
 // Approved corrections, cached for 20 seconds so one report doesn't re-read them
-App._getCorrectionsCached = async function () {
-  const now = Date.now();
-  if (!App._corrCache || now - App._corrCache.at > 20000) {
-    App._corrCache = { at: now, list: await App.getAttendanceCorrections() };
-  }
-  return App._corrCache.list;
-};
+App._getCorrectionsCached = () => App.getAttendanceCorrections();
 App.clearAttendanceCaches = function () {
-  App._corrCache = null;
+  App.clearReadCache();
   App._viewsCache = null;
+  App._viewsLoading = null;
+  App._stuCache = null;
+  App._stuLoading = null;
+  App._dayCache = {};
   App._attendanceCache = {};
 };
 
@@ -1055,14 +1125,16 @@ App.loadSubjectData = async function (subjectId) {
 };
 
 App._loadOwnSubjectData = async function (sid, me) {
-  const views = await App.StudentViews.mine();
-  const v = views[sid] || {};
+  const viewsP = App.StudentViews.mine();
   // closed days of the department offering the subject
   const subject = (await App.getSubjects()).find(s => String(s.id) === sid) || {};
-  const [dayStatuses, cancelDocs] = await Promise.all([
-    App.getDayStatuses(v.departmentId || subject.departmentId || ""),
+  const dept = subject.departmentId || ((await viewsP)[sid] || {}).departmentId || "";
+  const [views, dayStatuses, cancelDocs] = await Promise.all([
+    viewsP,
+    App.getDayStatuses(dept),
     App._getDocsByIdPrefix("classCancellations", sid + "_")
   ]);
+  const v = views[sid] || {};
   const byDate = {};
   Object.entries(v.days || {}).forEach(([date, status]) => { byDate[date] = { [me]: status }; });
   const corrections = Object.entries(v.corrections || {}).map(([date, correctedStatus]) =>
@@ -1154,13 +1226,17 @@ App._subjectModel = function (sid, byDate, markedByDate, dayStatuses, cancelDocs
 App.getVisibleSubjects = async function () {
   const user = Auth.currentUser();
   if (!user) return [];
+  // Start the other list now so the two reads run together
+  const extra = user.role === "Teacher" ? App.getSubjectAssignmentsFromFirestore()
+              : user.role === "Student" ? App.getEnrollments() : null;
+  if (extra) extra.catch(() => {});
   const subjects = await App.getSubjects();
   let list = subjects;
   if (user.role === "Teacher") {
-    const map = await App.getSubjectAssignmentsFromFirestore();
+    const map = await extra;
     list = subjects.filter(s => String(map[String(s.id)]) === String(user.id));
   } else if (user.role === "Student") {
-    const enr = await App.getEnrollments();
+    const enr = await extra;
     const me = String(user.studentId);
     list = subjects.filter(s => (enr[String(s.id)] || []).map(String).includes(me));
   }
@@ -1180,8 +1256,7 @@ App.subjectLabel = function (sub, batches) {
 };
 
 App.fillSubjectSelect = async function (select, { includeAll = true } = {}) {
-  const subjects = await App.getVisibleSubjects();
-  const batches = await App.getBatches();
+  const [subjects, batches] = await Promise.all([App.getVisibleSubjects(), App.getBatches()]);
   select.innerHTML = "";
   if (includeAll) {
     const o = document.createElement("option");
@@ -1511,7 +1586,8 @@ App.Accounts.showNewPasswords = function (rows, problems, title) {
   out.innerHTML = html;
 
   const dl = document.getElementById("downloadSlipsBtn");
-  if (dl) dl.onclick = () => {
+  if (dl) dl.onclick = async () => {
+    if (!(await App.lib("xlsx"))) return;
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Logins");
@@ -1625,7 +1701,8 @@ App.Archive.showRegister = async function (subject, batch) {
     </div>`;
     out.innerHTML = html;
 
-    document.getElementById("archRegExcelBtn").onclick = () => {
+    document.getElementById("archRegExcelBtn").onclick = async () => {
+      if (!(await App.lib("xlsx"))) return;
       const sheet = rows.map(({ st, t, cells }) => {
         const r = { Roll: st.roll, Name: st.name };
         dates.forEach((d, k) => { r[fmt(d)] = cells[k].mark + (cells[k].corrected ? "*" : "") + (cells[k].edited ? "†" : ""); });
@@ -1808,21 +1885,31 @@ App.HodDash.renderCorrections = async function () {
   document.getElementById("hodDashReviewBtn").onclick = () => showSection("correctionsSection");
 };
 
+// The department's attendance, leaves and "not held" records of one day
+App.HodDash._day = function (date) {
+  return App.cached(`day:${date}`, async () => {
+    const q = c => App.scoped(c).where("date", "==", date);
+    const [att, cancels, leaves] = await Promise.all([App._docs(q("attendance")), App._docs(q("classCancellations")), App._docs(q("leaves"))]);
+    const bySubject = list => Object.fromEntries(list.map(x => [String(x.subjectId), x]));
+    const leaveCount = {};
+    leaves.forEach(l => { leaveCount[String(l.subjectId)] = (leaveCount[String(l.subjectId)] || 0) + 1; });
+    return { attendance: bySubject(att), cancelled: bySubject(cancels), leaveCount };
+  });
+};
+
 App.HodDash.renderToday = async function (today) {
   const box = document.getElementById("hodDashToday");
   if (!box) return;
   box.innerHTML = "Loading…";
 
-  const closed = await App.isClosedDay(today, App.dept());
+  const [closed, subjects, batches, enrollments, assignments, teachers, day] = await Promise.all([
+    App.isClosedDay(today, App.dept()), App.getSubjects(), App.getBatches(), App.getEnrollments(),
+    App.getSubjectAssignmentsFromFirestore(), App.getTeachersFromFirestore(), App.HodDash._day(today)
+  ]);
   if (closed) {
     box.innerHTML = `<p style="margin:0;">🗓️ Today is closed (${App.esc(closed.reason || closed.type)}). No classes expected.</p>`;
     return;
   }
-
-  const [subjects, batches, enrollments, assignments, teachers] = await Promise.all([
-    App.getSubjects(), App.getBatches(), App.getEnrollments(),
-    App.getSubjectAssignmentsFromFirestore(), App.getTeachersFromFirestore()
-  ]);
 
   // Only subjects of ACTIVE semesters that have students
   const active = subjects.filter(s => {
@@ -1834,27 +1921,23 @@ App.HodDash.renderToday = async function (today) {
     return;
   }
 
-  const rows = await Promise.all(active.map(async s => {
-    const id = `${s.id}_${today}`;
-    const [attSnap, cancelSnap] = await Promise.all([
-      db.collection("attendance").doc(id).get(),
-      db.collection("classCancellations").doc(id).get()
-    ]);
+  const rows = active.map(s => {
+    const att = day.attendance[String(s.id)], cancel = day.cancelled[String(s.id)];
     const t = teachers.find(t => String(t.id) === String(assignments[String(s.id)]));
     let state, detail = "", order;
-    if (attSnap.exists) {
-      const recs = Object.values(attSnap.data().records || {});
+    if (att) {
+      const recs = Object.values(att.records || {});
       const p = recs.filter(v => App.normalizeStatus(v) === "Present").length;
-      const onLeave = (await App.getLeavesFor(s.id, today)).length;
+      const onLeave = day.leaveCount[String(s.id)] || 0;
       const a = recs.filter(v => App.normalizeStatus(v) === "Absent").length - onLeave;
       state = "✅ Marked"; detail = `${p} present, ${a} absent` + (onLeave ? `, ${onLeave} on leave` : ""); order = 2;
-    } else if (cancelSnap.exists) {
-      state = "🚫 Not held"; detail = cancelSnap.data().reason || ""; order = 1;
+    } else if (cancel) {
+      state = "🚫 Not held"; detail = cancel.reason || ""; order = 1;
     } else {
       state = "⏳ Not marked yet"; order = 0;
     }
     return { s, teacher: t ? t.name : "⚠️ No teacher assigned", state, detail, order };
-  }));
+  });
 
   rows.sort((x, y) => x.order - y.order || String(x.s.name).localeCompare(String(y.s.name)));
   const marked = rows.filter(r => r.order === 2).length;
@@ -2104,6 +2187,7 @@ App.Backup.downloadExcel = async function () {
         .sort(byKeys("Date"))
     };
 
+    if (!(await App.lib("xlsx"))) return;
     const wb = XLSX.utils.book_new();
     Object.entries(sheets).forEach(([name, rows]) => {
       const ws = XLSX.utils.json_to_sheet(rows.length ? rows : [{ Note: "No records" }]);
@@ -2661,10 +2745,9 @@ App.CourseTemplates = {
 // its subjects (e.g. a Minor). Admin/Principal: everyone.
 App.getStudents = async function () {
   try {
-    if (App.seesAll()) return await App._docs(db.collection("students"));
-    const own = await App._docs(App.scoped("students"));
+    if (App.seesAll()) return await App.getOwnStudents();
+    const [own, enrollments] = await Promise.all([App.getOwnStudents(), App.getEnrollments()]);
     const have = new Set(own.map(s => String(s.id)));
-    const enrollments = await App.getEnrollments();
     const others = [...new Set(Object.values(enrollments).flat().map(String))].filter(id => !have.has(id));
     return own.concat(await App.getStudentsByIds(others));
   } catch (e) {
@@ -2683,13 +2766,25 @@ App.getStudentsByIds = async function (ids) {
   return ids.map(id => (App._stuById[String(id)] || {}).data).filter(Boolean);
 };
 
+// The students enrolled in one subject (own department's and others')
+App.getStudentsIn = async function (subjectId) {
+  const [own, enrollments] = await Promise.all([App.getOwnStudents(), App.getEnrollments()]);
+  const ids = (enrollments[String(subjectId)] || []).map(String);
+  const have = new Set(own.map(s => String(s.id)));
+  const wanted = new Set(ids);
+  return own.filter(s => wanted.has(String(s.id))).concat(await App.getStudentsByIds(ids.filter(id => !have.has(id))));
+};
+
+// Only the department's own students (Admin/Principal: everyone)
+App.getOwnStudents = () => App.cached("students", () => App._docs(App.seesAll() ? db.collection("students") : App.scoped("students")));
+
 // Is this student one of the logged-in HOD's own (home department)?
 App.isOwnStudent = st => String(st.departmentId || "") === App.dept();
    
 App.getSubjects = async function () {
   try {
     if (App.role() === "Student") return (await App._studentData()).subjects;
-    return await App._docs(App.scoped("subjects"));
+    return await App.cached("subjects", () => App._docs(App.scoped("subjects")));
   } catch (e) {
     console.warn("Firestore subject read failed", e);
   }
@@ -2699,11 +2794,13 @@ App.getSubjects = async function () {
 App.getEnrollments = async function () {
   try {
     if (App.role() === "Student") return (await App._studentData()).enrollments;
-    const enrollments = {};
-    (await App.scoped("enrollments").get()).forEach(doc => {
-      enrollments[doc.id] = doc.data().students || [];
+    return await App.cached("enrollments", async () => {
+      const enrollments = {};
+      (await App.scoped("enrollments").get()).forEach(doc => {
+        enrollments[doc.id] = doc.data().students || [];
+      });
+      return enrollments;
     });
-    return enrollments;
   } catch (e) {
     console.warn("Firestore enrollment read failed", e);
   }
@@ -2714,7 +2811,7 @@ App.getBatches = async function () {
   try {
     const batches = App.role() === "Student"
       ? (await App._studentData()).batches
-      : await App._docs(App.scoped("batches"));
+      : await App.cached("batches", () => App._docs(App.scoped("batches")));
 
     // 🔥 FILTER OUT INVALID / GHOST BATCHES
     return batches.filter(b => b.id && b.semester && b.year && b.year !== 0);
@@ -3650,6 +3747,7 @@ if (uploadTeacherExcelBtn) {
 
     const reader = new FileReader();
     reader.onload = async e => {
+      if (!(await App.lib("xlsx"))) return;
       const data = new Uint8Array(e.target.result);
       const wb = XLSX.read(data, { type: "array" });
       const sheet = wb.Sheets[wb.SheetNames[0]];
@@ -4234,6 +4332,7 @@ uploadExcelBtn.onclick = () => {
 
   const reader = new FileReader();
   reader.onload = async function (e) {
+    if (!(await App.lib("xlsx"))) return;
     const data = new Uint8Array(e.target.result);
     const workbook = XLSX.read(data, { type: "array" });
     const sheetName = workbook.SheetNames[0];
@@ -4361,17 +4460,21 @@ if (uploadedSubject) {
 // INITIAL LOAD
 // ==========================
 // Run data migrations first
-async function initApp() {
-await renderBatches();
-await loadBatchesIntoSubjectSelect();
-await renderSubjects();
-await renderTeachers();
-await loadTeachersIntoAssignSelect();
-await renderTeacherAssignments();
-await loadBatchesForStudentManager();
-await loadBatchesForStudentUpload();
-await loadSubjectsForStudentUpload();
-await loadSubjectsIntoAssignSelect();
+let initAppRunning = null;
+function initApp() {
+  if (initAppRunning) return initAppRunning;
+  initAppRunning = Promise.all([
+    renderBatches(),
+    loadBatchesIntoSubjectSelect(),
+    renderSubjects(),
+    renderTeachers(),
+    loadTeachersIntoAssignSelect(),
+    renderTeacherAssignments(),
+    loadBatchesForStudentManager(),
+    loadBatchesForStudentUpload(),          // also fills the subjects for the upload
+    loadSubjectsIntoAssignSelect()
+  ]).finally(() => { initAppRunning = null; });
+  return initAppRunning;
 }
 
   // ==========================
@@ -4580,15 +4683,15 @@ html += "</tbody></table>";
   // Load Subjects
   // --------------------------
   async function loadSubjects() {
-    const subjects = await App.getSubjects();
-    const batches = await App.getBatches();
-    const enrollments = await App.getEnrollments();
+    const [subjects, batches, enrollments, map] = await Promise.all([
+      App.getSubjects(), App.getBatches(), App.getEnrollments(),
+      isTeacher ? App.getSubjectAssignmentsFromFirestore() : null
+    ]);
 
     subjectSelect.innerHTML = `<option value="">-- Select Subject --</option>`;
     let allowed = subjects;
 
     if (isTeacher) {
-      const map = await App.getSubjectAssignmentsFromFirestore();
       allowed = subjects.filter(s => {
         const isAssigned = String(map[String(s.id)]) === String(user.id);
         const batch = batches.find(b => String(b.id) === String(s.batchId) && String(b.semester) === String(s.semester));
@@ -4657,27 +4760,23 @@ html += "</tbody></table>";
     studentList.innerHTML = "<p>Loading…</p>";
     saveBar.style.display = "none";
 
-    const subject = (await App.getSubjects()).find(s => String(s.id) === subjectId);
+    // Everything this screen needs, read at once
+    const [subjects, batches, closed, cancellation, enrollments, students, attDoc, settings, subjData] = await Promise.all([
+      App.getSubjects(), App.getBatches(), App.isClosedDay(date, App.dept()), App.getClassCancellation(subjectId, date),
+      App.getEnrollments(), App.getStudentsIn(subjectId), App.getAttendanceDoc(subjectId, date), App.getSettings(),
+      App.loadSubjectData(subjectId)                               // corrections, leaves, casual counts
+    ]);
     if (stale()) return;
+    const subject = subjects.find(s => String(s.id) === subjectId);
     if (!subject) { showMessage("Subject not found."); return; }
-
-    if (!(await App.isBatchOpen(subject.batchId, subject.semester))) { if (!stale()) showMessage("Semester is closed."); return; }
-    if (await App.isClosedDay(date, subject.departmentId || App.dept())) { if (!stale()) showMessage("Day is closed."); return; }
-    if (stale()) return;
+    const batch = batches.find(b => String(b.id) === String(subject.batchId) && String(b.semester) === String(subject.semester));
+    if (!(batch && batch.status === "ACTIVE")) { showMessage("Semester is closed."); return; }
+    if (closed) { showMessage("Day is closed."); return; }
     if (date > new Date().toLocaleDateString("en-CA")) { showMessage("Attendance can't be marked for a future date."); return; }
-
-    const cancellation = await App.getClassCancellation(subjectId, date);
-    if (stale()) return;
     if (cancellation) { showMessage("Class not held."); return; }
 
-    const [enrollments, students, attDoc, settings] = await Promise.all([
-      App.getEnrollments(), App.getStudents(), App.getAttendanceDoc(subjectId, date), App.getSettings()
-    ]);
     const record = attDoc ? attDoc.records || {} : {};
-    App.clearAttendanceCaches();
-    const subjData = await App.loadSubjectData(subjectId);     // corrections, leaves, casual counts
     const leaveLimit = settings.casualLeaveLimit;
-    if (stale()) return;
 
     const ids = (enrollments[String(subjectId)] || [])
       .map(id => students.find(s => String(s.id) === String(id)))
@@ -5069,10 +5168,12 @@ App.Reports.init = async function () {
     reportOutput.innerHTML = "<p>Generating report…</p>";
 
     const user = Auth.currentUser();
-    const allStudents = await App.getStudents();
-    const subjects = await getAllowedSubjects();
-    const batches = await App.getBatches();
-    const enrollments = await App.getEnrollments();
+    const [allStudents, subjects, batches, enrollments] = await Promise.all([
+      App.getStudents(), getAllowedSubjects(), App.getBatches(), App.getEnrollments()
+    ]);
+    const chosen = subjects.filter(s => selectedSubject === "all" || String(s.id) === selectedSubject);
+    const dataOf = {};
+    (await Promise.all(chosen.map(s => App.loadSubjectData(s.id)))).forEach((d, i) => { dataOf[chosen[i].id] = d; });
 
     let output = `
   <h2 style="margin-bottom:10px;">Attendance Summary Report</h2>
@@ -5087,7 +5188,7 @@ App.Reports.init = async function () {
     for (const subject of subjects) {
       if (selectedSubject !== "all" && String(subject.id) !== selectedSubject) continue;
 
-      const data = await App.loadSubjectData(subject.id);
+      const data = dataOf[subject.id];
       const currentIds = (enrollments[String(subject.id)] || []).map(String);
       let ids = [...new Set([...currentIds, ...data.recordedStudentIds()])];
       if (user && user.role === "Student") ids = ids.filter(id => id === String(user.studentId));
@@ -5430,8 +5531,11 @@ App.Student.init = async function () {
   output.innerHTML = "<p>Loading your attendance…</p>";
 
   try {
-    const batches = await App.getBatches();
-    const meSnap = await db.collection("students").doc(String(user.studentDocId)).get();
+    const [batches, meSnap, mySubjects] = await Promise.all([
+      App.getBatches(),
+      db.collection("students").doc(String(user.studentDocId)).get(),
+      App.getVisibleSubjects()                       // only subjects I'm enrolled in
+    ]);
     const me = meSnap.exists ? meSnap.data() : null;
     if (!me) {
       output.innerHTML = "<p>Your record could not be found. Please contact the department.</p>";
@@ -5440,7 +5544,6 @@ App.Student.init = async function () {
 
     infoBox.innerHTML = `<b>Name:</b> ${App.esc(me.name)} <br> <b>Roll:</b> ${App.esc(me.roll)}`;
 
-    const mySubjects = await App.getVisibleSubjects();   // only subjects I'm enrolled in
     if (mySubjects.length === 0) {
       output.innerHTML = "<p>You are not enrolled in any subjects yet.</p>";
       return;
@@ -5448,14 +5551,14 @@ App.Student.init = async function () {
 
     // Group subjects by semester (newest batch/semester first)
     const groups = {};
-    for (const sub of mySubjects) {
+    const allData = await Promise.all(mySubjects.map(sub => App.loadSubjectData(sub.id)));
+    mySubjects.forEach((sub, i) => {
       const batch = batches.find(b => String(b.id) === String(sub.batchId) &&
                                       String(b.semester) === String(sub.semester));
       const key = `${sub.program} Semester ${sub.semester} (Batch ${sub.year})`;
       if (!groups[key]) groups[key] = { status: batch ? batch.status : "", sem: Number(sub.semester), rows: [] };
-      const data = await App.loadSubjectData(sub.id);
-      groups[key].rows.push({ sub, t: data.tally(me.id) });
-    }
+      groups[key].rows.push({ sub, t: allData[i].tally(me.id) });
+    });
 
     let html = "";
     Object.entries(groups)
@@ -6232,10 +6335,7 @@ if (id !== "archiveSection") {
 
 App.getCorrectionRequests = async function () {
   try {
-    const snapshot = await App.scoped("correctionRequests").get();
-    const list = [];
-    snapshot.forEach(doc => list.push(doc.data()));
-    return list;
+    return await App.cached("correctionRequests", () => App._docs(App.scoped("correctionRequests")));
   } catch (e) {
     console.warn("Firestore read failed", e);
     return [];
@@ -6244,10 +6344,7 @@ App.getCorrectionRequests = async function () {
 
 App.getAttendanceCorrections = async function () {
   try {
-    const snapshot = await App.scoped("attendanceCorrections").get();
-    const list = [];
-    snapshot.forEach(doc => list.push(doc.data()));
-    return list;
+    return await App.cached("attendanceCorrections", () => App._docs(App.scoped("attendanceCorrections")));
   } catch (e) {
     console.warn("Firestore read failed", e);
     return [];
@@ -6707,7 +6804,7 @@ App.HODCorrections.init = async function () {
   await render();                           // initial draw
 };
 
-function exportToExcel() {
+async function exportToExcel() {
   // Find the report table currently visible
   const table =
     document.querySelector("#reportOutput table") ||
@@ -6718,6 +6815,7 @@ function exportToExcel() {
     UI.alert("Please generate a report first.");
     return;
   }
+  if (!(await App.lib("xlsx"))) return;
 
   // Create a new Excel workbook
   const workbook = XLSX.utils.book_new();
@@ -6731,7 +6829,7 @@ function exportToExcel() {
   // Download the Excel file
   XLSX.writeFile(workbook, "attendance_report.xlsx");
   }
-  function exportToPDF() {
+  async function exportToPDF() {
   // Prefer register view if it exists, else summary view
   const content =
     document.getElementById("registerOutput").innerHTML.trim()
@@ -6744,6 +6842,8 @@ function exportToExcel() {
     return;
   }
 
+  if (!(await App.lib("pdf"))) return;
+
   // Convert visible content to PDF
   html2pdf()
     .set({
@@ -6755,7 +6855,7 @@ function exportToExcel() {
     .save();
   }
   document.getElementById("exportDefaultersExcelBtn")
-  ?.addEventListener("click", function () {
+  ?.addEventListener("click", async function () {
 
     const table = document.querySelector("#defaultersOutput table");
 
@@ -6763,6 +6863,7 @@ function exportToExcel() {
       UI.alert("Please generate defaulters list first.");
       return;
     }
+    if (!(await App.lib("xlsx"))) return;
     const workbook = XLSX.utils.book_new();
     const sheet = XLSX.utils.table_to_sheet(table);
 
@@ -6774,9 +6875,9 @@ function exportToExcel() {
 // HOD EXECUTIVE DASHBOARD (ENHANCED)
 // ==========================================
   App.updateHODStats = async function() {
-  const students = (await App.getStudents()).filter(App.isOwnStudent);
   const today = new Date().toLocaleDateString("en-CA");   // local date, YYYY-MM-DD
-  const subjects = await App.getSubjects();
+  const [allStudents, day] = await Promise.all([App.getOwnStudents(), App.HodDash._day(today)]);
+  const students = allStudents.filter(App.isOwnStudent);
 
   // 📈 STOCK: Total counts in the department
   const activeCount = students.filter(s => !s.status || s.status === "ACTIVE").length;
@@ -6788,20 +6889,15 @@ function exportToExcel() {
   let totalAbsentToday = 0;
   let classesConductedToday = 0;
 
-  for (const sub of subjects) {
-  const attendance = await App.getAttendance(sub.id, today);
-
-  if (attendance && Object.keys(attendance).length > 0) {
+  Object.entries(day.attendance).forEach(([sid, att]) => {
     classesConductedToday++;
-
-    Object.values(attendance).forEach(status => {
+    Object.values(att.records || {}).forEach(status => {
       const s = App.normalizeStatus(status);
       if (s === "Present") totalPresentToday++;
       if (s === "Absent") totalAbsentToday++;
     });
-    totalAbsentToday -= (await App.getLeavesFor(sub.id, today)).length;   // leave is not absence
-  }
-}
+    totalAbsentToday -= day.leaveCount[sid] || 0;   // leave is not absence
+  });
 
   const widget = document.getElementById("hodStatsWidget");
   if (widget) {
@@ -6886,5 +6982,6 @@ App.downloadAlumniPDF = async function() {
     jsPDF: { unit: 'in', format: 'letter', orientation: 'portrait' }
   };
 
+  if (!(await App.lib("pdf"))) return;
   html2pdf().from(html).set(opt).save();
 };
