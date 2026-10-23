@@ -15,7 +15,7 @@ function startAppCheck(app) {
   if (typeof appCheckSiteKey === "undefined" || !appCheckSiteKey || !firebase.appCheck) return;
   if (["localhost", "127.0.0.1"].includes(location.hostname)) return;   // can't be verified on this computer
   try {
-    app.appCheck().activate(new firebase.appCheck.ReCaptchaV3Provider(appCheckSiteKey), true);
+    app.appCheck().activate(new firebase.appCheck.ReCaptchaEnterpriseProvider(appCheckSiteKey), true);
   } catch (e) {
     console.warn("App Check not started", e);
   }
@@ -397,7 +397,8 @@ App.autoLoginId = function (input, suggest) {
     if (!input.dataset.auto) return;
     const my = ++seq;
     const id = await suggest();
-    if (my === seq && input.dataset.auto) input.value = id;
+    // not while someone is in the field: their typing would be joined to it
+    if (my === seq && input.dataset.auto && document.activeElement !== input) input.value = id;
   };
 };
 

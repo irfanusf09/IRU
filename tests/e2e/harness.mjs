@@ -41,7 +41,7 @@ export async function start({ publicDir = PUBLIC, rules = RULES, timezoneId, vie
         // Each App Check start is recorded with its key. reCAPTCHA (Google) can't be reached
         // from tests, so a stand-in gives a token at once, as reCAPTCHA would.
         window.__appCheck = [];
-        firebase.appCheck.ReCaptchaV3Provider = function (key) {
+        firebase.appCheck.ReCaptchaEnterpriseProvider = function (key) {
           window.__appCheck.push(key);
           return new firebase.appCheck.CustomProvider({ getToken: async () => ({ token: "test-token", expireTimeMillis: Date.now() + 3600000 }) });
         };` : ""}
@@ -97,7 +97,15 @@ export async function start({ publicDir = PUBLIC, rules = RULES, timezoneId, vie
       await page.waitForSelector("#loginScreen", { state: "visible" });
       await page.fill("#loginUsername", id); await page.fill("#loginPassword", password);
       await page.click("#loginBtn");
-      await page.waitForSelector("#passwordPanel", { state: "visible", timeout: 10000 });
+      try { await page.waitForSelector("#passwordPanel", { state: "visible", timeout: 10000 }); }
+      catch (e) {
+        const seen = await page.evaluate(() => ({ error: document.getElementById("loginError").textContent,
+          app: !!document.getElementById("appContainer").offsetParent, login: !!document.getElementById("loginScreen").offsetParent,
+          user: localStorage.getItem("currentUser") }));
+        console.log("FIRST LOGIN FAILED:", JSON.stringify(seen), "\n", errors.join("\n"));
+        await page.screenshot({ path: `${SHOTS}/first-login-failed.png`, fullPage: true });
+        throw e;
+      }
       await page.fill("#pwNew", newPassword); await page.fill("#pwConfirm", newPassword);
       await page.click("#pwSaveBtn");
       await page.waitForSelector("#appContainer", { state: "visible", timeout: 10000 });
