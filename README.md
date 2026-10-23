@@ -50,6 +50,7 @@ Running it for a single department is the same app with one department.
 | `firebase.json`, `.firebaserc` | Firebase Hosting / deploy settings |
 | `tests/` | Automated tests of the database rules |
 | `tools/demo-seed/` | Fills an empty project with a sample institution, for demonstrations |
+| `tools/reset-login/` | Project owner's tool: look up login IDs and give a forgotten login a new password |
 
 ## Deploying
 
@@ -117,6 +118,26 @@ has data, and on the real project.
    ```
 
 It prints the demo logins (one shared password).
+
+## Forgotten logins
+
+- Anyone with a confirmed recovery email: **Forgot password?** on the login screen.
+- Teachers and students: their HOD resets the password. HODs and the Principal: the
+  Institution Admin.
+- The Institution Admin (or anyone, if needed): the project owner runs `tools/reset-login`:
+
+  1. Firebase console → Project settings → Service accounts → **Generate new private key**.
+     Keep that file private and delete it afterwards.
+  2. Run:
+
+     ```sh
+     cd tools/reset-login
+     npm install
+     node reset.mjs --key /path/to/key.json                  # shows Admin, Principal and HOD login IDs
+     node reset.mjs --key /path/to/key.json --login admin    # gives that login a new password
+     ```
+
+  They choose their own password at the next login.
 
 ## Students' attendance copies
 
