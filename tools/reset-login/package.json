@@ -1,0 +1,9 @@
+{
+  "name": "attendance-reset-login",
+  "private": true,
+  "type": "module",
+  "description": "Project owner's tool: look up login IDs and set a new password for any login.",
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}

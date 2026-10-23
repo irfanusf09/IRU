@@ -56,7 +56,8 @@
   <p id="iosInstallHint" style="display:none; font-size:12px; color:#6b7280;">
     📲 To install on iPhone/iPad: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b>.
   </p>
-  <p style="font-size:12px; color:#6b7280;">You can log in with your login ID, or with your recovery email if you have confirmed one.</p>
+  <p style="font-size:12px; color:#6b7280;">Students: your <b>roll number</b>. Staff: the login ID you were given (e.g. <b>phy.asha</b>, <b>hod.phy</b>).
+    You can also use your recovery email if you have confirmed one.</p>
   <p style="font-size:13px;"><a href="#" id="forgotLink">Forgot password?</a></p>
   <div id="forgotPanel" style="display:none; margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fff;">
     <p style="font-size:13px; margin-top:0;">If you have confirmed a recovery email, enter it to get a reset link.
@@ -366,13 +367,15 @@
 
   <div class="admin-tab" data-tab="teachers" role="tabpanel">
   <h2>Teacher Account Manager</h2>
+  <p style="font-size:13px; color:#6b7280;">Excel columns: <b>Name</b>; optional <b>Username</b> (otherwise a login ID like phy.asha is made)
+    and <b>Password</b> (otherwise one is generated).</p>
   <input type="file" id="teacherExcelFile" accept=".xlsx,.xls">
 <button id="uploadTeacherExcelBtn">Upload Teachers (Excel)</button>
 <p id="teacherUploadStatus"></p>
 
 <hr>
   <input type="text" id="teacherNameInput" placeholder="Teacher name">
-  <input type="text" id="teacherUsernameInput" placeholder="Username">
+  <input type="text" id="teacherUsernameInput" placeholder="Login ID (filled in for you)" autocapitalize="none">
   <input type="text" id="teacherPasswordInput" placeholder="Starting password (min 6)">
 
   <button id="addTeacherBtn">Add Teacher</button>
@@ -447,7 +450,8 @@
   Casual leave is limited per subject per semester. Medical, NCC and Other leave are not limited.
   Leave days are left out of the attendance percentage.
 </p>
-<p>Casual leaves allowed per subject per semester: <b id="casualLeaveLimitShow">…</b>
+<p>Casual leaves allowed per subject per semester: <b id="casualLeaveLimitShow">…</b><br>
+  Teachers can change attendance they saved for: <b id="editWindowShow">…</b>
   <span style="font-size:13px; color:#6b7280;">(set by the Institution Admin for all departments)</span></p>
 
 <h2 style="margin-top:28px;">Student attendance copies</h2>
@@ -574,6 +578,8 @@
     <div id="deptList" style="overflow-x:auto;">Loading…</div>
     <h3>Add a department</h3>
     <input type="text" id="deptNameInput" placeholder="Department name (e.g. Physics)">
+    <input type="text" id="deptCodeInput" placeholder="Code (e.g. PHY)" maxlength="5" style="width:110px; text-transform:uppercase;" autocapitalize="characters"
+           title="Short code used in login IDs, e.g. hod.phy and phy.asha">
     <label><input type="checkbox" id="deptUG" checked> UG</label>
     <label><input type="checkbox" id="deptPG"> PG</label>
     <label><input type="checkbox" id="deptIG"> IG</label>
@@ -592,7 +598,7 @@
     </select>
     <select id="leaderDept"></select>
     <input type="text" id="leaderName" placeholder="Name">
-    <input type="text" id="leaderLoginId" placeholder="Login ID (e.g. hod.physics)" autocapitalize="none">
+    <input type="text" id="leaderLoginId" placeholder="Login ID (filled in for you)" autocapitalize="none">
     <button id="addLeaderBtn" class="primary">Create login</button>
   </div>
 
@@ -620,7 +626,12 @@
     </p>
     <label for="casualLeaveLimitInput">Casual leaves allowed per subject per semester:</label>
     <input type="number" id="casualLeaveLimitInput" min="0" max="60" step="1" style="width:90px;">
-    <button id="saveLeaveLimitBtn" onclick="App.Settings.save()">Save</button>
+    <br>
+    <label for="editWindowInput">Teachers can change attendance they saved for</label>
+    <input type="number" id="editWindowInput" min="0" max="180" step="5" style="width:90px;"> minutes
+    <p style="font-size:13px; color:#6b7280; margin-top:4px;">Never past midnight of that day. Every change is kept and marked † in registers.
+      0 = no changes; corrections then always go to the HOD.</p>
+    <button id="saveLeaveLimitBtn" onclick="App.Settings.save()" class="primary">Save rules</button>
     <p style="font-size:13px; color:#6b7280;">Minimum attendance: <b>75%</b> (all departments).</p>
 
     <h2 style="margin-top:28px;">Backup</h2>

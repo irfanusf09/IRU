@@ -13,10 +13,21 @@ There is no build step and no server code.
 | **Institution Admin** | Every department | Adds departments; creates HOD and Principal logins; sets institution rules (casual leave limit); closes days for the whole institution; full backup |
 | **Principal** | Every department, view only | Institution Dashboard: per day, classes held / not held / not marked, present / absent / leave, who took which class |
 | **HOD** | Their department | Batches, subjects, teachers, students and their logins, closed days, correction decisions, reports, backup |
-| **Teacher** | Their subjects | Marks attendance once per class per day, records leave, requests corrections |
+| **Teacher** | Their subjects | Marks attendance once per class per day (and can change it for a short while, see below), records leave, requests corrections |
 | **Student** | Their own records | Dashboard and day-by-day register for all their subjects, from any department |
 
 The database rules (`firestore.rules`) enforce this on Google's servers, not just on screen.
+
+**Login IDs** are suggested by the app: students use their **roll number**; HODs
+`hod.<department code>` (e.g. `hod.phy`); teachers `<code>.<first name>` (e.g. `phy.asha`,
+then `phy.asha.bhat` or `phy.asha2` if taken). The Institution Admin sets each department's
+short code. Logins created earlier keep their IDs.
+
+**Changing saved attendance:** the teacher who saved a class can change its marks for a
+while afterwards (late arrivals, mistakes) — 60 minutes by default, set by the Institution
+Admin (0–180), and never past midnight. The first-saved marks are kept; changed entries
+are marked **†** in registers. After that, corrections go to the HOD as before. Google's
+servers check the time, so a phone's clock can't extend it.
 
 A department can teach students of other departments (e.g. a Minor): its HOD uploads the
 roll numbers, the students are found in their home department, and the offering HOD sees
@@ -39,6 +50,7 @@ Running it for a single department is the same app with one department.
 | `firebase.json`, `.firebaserc` | Firebase Hosting / deploy settings |
 | `tests/` | Automated tests of the database rules |
 | `tools/demo-seed/` | Fills an empty project with a sample institution, for demonstrations |
+| `tools/reset-login/` | Project owner's tool: look up login IDs and give a forgotten login a new password |
 
 ## Deploying
 
@@ -106,6 +118,26 @@ has data, and on the real project.
    ```
 
 It prints the demo logins (one shared password).
+
+## Forgotten logins
+
+- Anyone with a confirmed recovery email: **Forgot password?** on the login screen.
+- Teachers and students: their HOD resets the password. HODs and the Principal: the
+  Institution Admin.
+- The Institution Admin (or anyone, if needed): the project owner runs `tools/reset-login`:
+
+  1. Firebase console → Project settings → Service accounts → **Generate new private key**.
+     Keep that file private and delete it afterwards.
+  2. Run:
+
+     ```sh
+     cd tools/reset-login
+     npm install
+     node reset.mjs --key /path/to/key.json                  # shows Admin, Principal and HOD login IDs
+     node reset.mjs --key /path/to/key.json --login admin    # gives that login a new password
+     ```
+
+  They choose their own password at the next login.
 
 ## Students' attendance copies
 

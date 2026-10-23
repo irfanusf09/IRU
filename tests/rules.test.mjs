@@ -5,6 +5,10 @@
 import { test, before, after, beforeEach } from "node:test";
 import fs from "node:fs";
 import { initializeTestEnvironment, assertSucceeds, assertFails } from "@firebase/rules-unit-testing";
+import firebase from "firebase/compat/app";
+import "firebase/compat/firestore";
+const serverTime = () => firebase.firestore.FieldValue.serverTimestamp();
+const minutesAgo = m => firebase.firestore.Timestamp.fromMillis(Date.now() - m * 60000);
 
 const MONDAY = "2026-10-19";
 const TUESDAY = "2026-10-20";
@@ -85,7 +89,7 @@ async function seed() {
 
 const as = uid => env.authenticatedContext(uid).firestore();
 const attendance = (subjectId, date, records = { [ME]: "Present" }, departmentId = "ECO") =>
-  ({ subjectId, date, records, markedBy: "T1", timestamp: 1, markedAt: "x", departmentId });
+  ({ subjectId, date, records, markedBy: "T1", timestamp: 1, markedAt: "x", departmentId, savedAt: serverTime() });
 const dayView = (studentId, subjectId, date, status, departmentId = "ECO") =>
   ({ studentId, subjectId, departmentId, days: { [date]: status }, last: date });
 
@@ -115,6 +119,13 @@ for (const [why, uid, subjectId, date, dept] of [
   });
 }
 
+test("attendance must carry the server's save time", async () => {
+  const { savedAt, ...noTime } = attendance(SUBJECT, MONDAY);
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).set(noTime));
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).set({ ...noTime, savedAt: minutesAgo(-30) }));   // a made-up time
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).set({ ...attendance(SUBJECT, MONDAY), originalRecords: {} }));
+});
+
 test("saved attendance cannot be changed or deleted", async () => {
   const ref = as("t1").doc(`attendance/${SUBJECT}_${TUESDAY}`);
   await assertFails(ref.set(attendance(SUBJECT, TUESDAY)));
@@ -127,6 +138,88 @@ test("only teachers mark attendance (not HOD, Admin or Principal)", async () => 
   for (const uid of ["hod", "admin", "principal"]) {
     await assertFails(as(uid).doc(`attendance/${SUBJECT}_${MONDAY}`).set(attendance(SUBJECT, MONDAY)));
   }
+});
+
+// ---------- Edit window: the teacher who saved may change marks for a while ----------
+const SAVED = { [ME]: "Absent", [CLASSMATE]: "Present" };
+async function savedClass(minutes, extra = {}, subjectId = SUBJECT) {
+  await env.withSecurityRulesDisabled(ctx => ctx.firestore().doc(`attendance/${subjectId}_${MONDAY}`).set({
+    subjectId, date: MONDAY, records: SAVED, markedBy: "T1", departmentId: "ECO", savedAt: minutesAgo(minutes), ...extra }));
+}
+const edit = (records, original = SAVED, by = "T1") =>
+  ({ records, originalRecords: original, editedAt: serverTime(), editedBy: by });
+const setWindow = m => env.withSecurityRulesDisabled(ctx => ctx.firestore().doc("config/settings").set({ editWindowMinutes: m }));
+const istMinutesToday = () => { const d = new Date(Date.now() + 330 * 60000); return d.getUTCHours() * 60 + d.getUTCMinutes(); };
+
+test("teacher corrects a mark soon after saving; the first marks are kept", async () => {
+  await savedClass(10);
+  const ref = as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`);
+  if (istMinutesToday() < 11) return;                       // saved before midnight: nothing to test
+  await assertSucceeds(ref.update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+  // a second change must keep the first-saved marks
+  await assertFails(ref.update(edit({ [ME]: "Absent", [CLASSMATE]: "Present" }, { [ME]: "Present", [CLASSMATE]: "Present" })));
+  await assertSucceeds(ref.update(edit({ [ME]: "Absent", [CLASSMATE]: "Absent" })));
+});
+
+test("no change after the window (default 60 minutes)", async () => {
+  await savedClass(61);
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+});
+
+test("the Institution Admin's window setting applies", async () => {
+  await setWindow(90);
+  await savedClass(75);
+  if (istMinutesToday() >= 76) {
+    await assertSucceeds(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+  }
+  await setWindow(0);
+  await savedClass(1);
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+});
+
+test("no change after midnight (India time) of the day it was saved", async () => {
+  await setWindow(1440);
+  await savedClass(istMinutesToday() + 1);                   // saved at 23:59 yesterday, India time
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${MONDAY}`).update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+});
+
+test("only the teacher who saved, only the marks", async () => {
+  await savedClass(5);
+  const ref = s => as(s).doc(`attendance/${SUBJECT}_${MONDAY}`);
+  await assertFails(ref("t2").update(edit({ [ME]: "Present", [CLASSMATE]: "Present" }, SAVED, "T2")));
+  await assertFails(ref("hod").update(edit({ [ME]: "Present", [CLASSMATE]: "Present" })));
+  await assertFails(ref("t1").update(edit({ [ME]: "Present" })));                                         // drops a student
+  await assertFails(ref("t1").update(edit({ [ME]: "Present", [CLASSMATE]: "Present", [STUDENTS[5]]: "Present" })));   // adds one
+  await assertFails(ref("t1").update(edit({ [ME]: "Present", [CLASSMATE]: "Present" }, { [ME]: "Present", [CLASSMATE]: "Present" })));   // rewrites the first marks
+  await assertFails(ref("t1").update({ ...edit({ [ME]: "Present", [CLASSMATE]: "Present" }), date: TUESDAY }));
+  await assertFails(ref("t1").update({ ...edit({ [ME]: "Present", [CLASSMATE]: "Present" }), editedAt: minutesAgo(0) }));
+  await assertFails(ref("t1").update(edit({ [ME]: "Present", [CLASSMATE]: "Present" }, SAVED, "T2")));
+  await assertFails(ref("t1").delete());
+});
+
+test("a teacher newly assigned to the subject can't change the previous teacher's marks", async () => {
+  await savedClass(5, {}, OTHER_SUBJECT);                    // marked by T1, now taught by T2
+  await assertFails(as("t2").doc(`attendance/${OTHER_SUBJECT}_${MONDAY}`).update(edit({ [ME]: "Present", [CLASSMATE]: "Present" }, SAVED, "T2")));
+});
+
+test("records saved before the window existed (no save time) stay locked", async () => {
+  await assertFails(as("t1").doc(`attendance/${SUBJECT}_${TUESDAY}`).update({
+    records: { [ME]: "Present" }, originalRecords: {}, editedAt: serverTime(), editedBy: "T1" }));
+});
+
+test("the class summary changes only together with an edit", async () => {
+  await savedClass(5);
+  if (istMinutesToday() < 6) return;
+  const db = as("t1");
+  const sum = (present, absent) => ({ departmentId: "ECO", subjectId: SUBJECT, date: MONDAY, subjectName: "x", teacherId: "T1",
+    teacherName: "t", present, absent, leave: 0, markedAt: "x" });
+  await env.withSecurityRulesDisabled(ctx => ctx.firestore().doc(`classSummaries/${SUBJECT}_${MONDAY}`).set(sum(1, 1)));
+  await assertFails(db.doc(`classSummaries/${SUBJECT}_${MONDAY}`).set(sum(2, 0)));                       // alone
+  const b = db.batch();
+  b.update(db.doc(`attendance/${SUBJECT}_${MONDAY}`), edit({ [ME]: "Present", [CLASSMATE]: "Present" }));
+  b.set(db.doc(`classSummaries/${SUBJECT}_${MONDAY}`), sum(2, 0));
+  b.set(db.doc(`studentViews/${ME}_${SUBJECT}`), dayView(ME, SUBJECT, MONDAY, "Present"), { merge: true });
+  await assertSucceeds(b.commit());
 });
 
 // ---------- Teacher writes students' copies ----------
