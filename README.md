@@ -211,14 +211,16 @@ what they may see or change, but such a script could run up usage. **App Check**
 Google answer only requests from this app's own pages. It is **off** until a site key is
 filled in. Do the test project first, and use it for a few days before the real one.
 
-1. Google reCAPTCHA admin (google.com/recaptcha/admin) → create a key: type
-   **reCAPTCHA v3**, domains: the project's addresses (e.g.
-   `attendance-system-demo-cbec9.web.app`, `attendance-system-demo-cbec9.firebaseapp.com`).
-   You get a **site key** (public) and a **secret key** (private). (Google changes these
-   pages from time to time; if it sends you elsewhere or asks for billing details, stop
-   and check before going on.)
-2. Firebase console → **App Check** → Apps → your web app → **reCAPTCHA** → paste the
-   **secret key** there (only there; never in the code, never in a chat).
+1. Google Cloud console (same project) → search **reCAPTCHA** (Fraud Defense, formerly
+   reCAPTCHA Enterprise) → enable the API if asked → **Create key**: platform **Website**,
+   domains: the project's addresses (e.g. `attendance-system-demo-cbec9.web.app`,
+   `attendance-system-demo-cbec9.firebaseapp.com`), no checkbox challenge. You get one
+   **site key** (public; there is no secret key). If it asks for billing details, stop and
+   check before going on. (Firebase still offers "reCAPTCHA" classic v3 too; it is
+   deprecated, so it isn't used here.)
+2. Firebase console → **App Check** → Apps → your web app → **Fraud Defense** → paste the
+   site key, **Token time to live: 24 hours** (each new token uses one check from the
+   free allowance), App risk: Medium → **Register**. Nothing is enforced yet.
 3. Put the **site key** in `public/firebase-config.js` → `APP_CHECK_SITE_KEYS.test`, then
    `firebase deploy -P test`.
 4. Use the app normally for a few days, including from the college network. App Check →
@@ -233,6 +235,8 @@ Good to know:
   forever). That is why step 4 includes the college network.
 - On `localhost` App Check is skipped, so the app can't be opened from your computer
   against an enforced project.
+- Free use is limited (Fraud Defense "Essentials"). Before enforcing on the real project,
+  check the usage the test project shows against Google's current free limit.
 - Keep **Authentication → Settings → User actions → Enable create (sign-up)** ON: the app
   creates teacher and student logins from the HOD's browser.
 

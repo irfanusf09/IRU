@@ -41,7 +41,7 @@ export async function start({ publicDir = PUBLIC, rules = RULES, timezoneId, vie
         // Each App Check start is recorded with its key. reCAPTCHA (Google) can't be reached
         // from tests, so a stand-in gives a token at once, as reCAPTCHA would.
         window.__appCheck = [];
-        firebase.appCheck.ReCaptchaV3Provider = function (key) {
+        firebase.appCheck.ReCaptchaEnterpriseProvider = function (key) {
           window.__appCheck.push(key);
           return new firebase.appCheck.CustomProvider({ getToken: async () => ({ token: "test-token", expireTimeMillis: Date.now() + 3600000 }) });
         };` : ""}
