@@ -36,3 +36,15 @@ const TEST_HOSTS = [
 const firebaseConfig = TEST_HOSTS.includes(location.hostname)
   ? FIREBASE_PROJECTS.test
   : FIREBASE_PROJECTS.real;
+
+// App Check (reCAPTCHA v3) site key for each project. Empty = App Check off.
+// The site key is public; the matching SECRET key goes only into the Firebase
+// console (App Check -> register the web app), never into this file.
+// See README -> "App Check".
+const APP_CHECK_SITE_KEYS = {
+  real: "",
+  test: ""
+};
+const appCheckSiteKey = TEST_HOSTS.includes(location.hostname)
+  ? APP_CHECK_SITE_KEYS.test
+  : APP_CHECK_SITE_KEYS.real;

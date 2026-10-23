@@ -1,0 +1,4 @@
+# Backups contain everyone's records: never commit them
+*.json.gz
+*.part
+node_modules/

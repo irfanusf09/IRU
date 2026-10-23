@@ -1,0 +1,9 @@
+{
+  "name": "attendance-backup",
+  "private": true,
+  "type": "module",
+  "description": "Project owner's tools: copy the whole database to a file, and put it back.",
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  }
+}

@@ -1,0 +1,87 @@
+// System-suggested login IDs with department codes.
+import { start, SHOTS } from "./harness.mjs";
+import * as XLSX from "@e965/xlsx";
+import fs from "fs";
+import { TMP } from "./paths.mjs";
+XLSX.set_fs(fs);
+const h = await start();
+const { page, admin, check, log } = h;
+const tmp = TMP;
+const pw = text => (text.match(/(?:Starting password|Password): (\S+)/) || [])[1];
+const settle = () => page.waitForTimeout(800);
+
+log("Admin: department code and HOD login ID suggested");
+await page.goto("http://localhost:5555/");
+await page.click("#setupLink");
+await page.fill("#setupInstitution", "Test College"); await page.fill("#setupName", "Office Admin");
+await page.fill("#setupPassword", "adminpass1"); await page.fill("#setupPassword2", "adminpass1");
+await page.click("#setupBtn"); await h.alertText();
+await page.waitForSelector("#institutionSection.active");
+await page.click("#instTabs button[data-tab=departments]");
+await page.type("#deptNameInput", "Physics");
+check("code suggested from the name: PHY", (await page.inputValue("#deptCodeInput")) === "PHY", await page.inputValue("#deptCodeInput"));
+await page.click("#addDeptBtn"); await h.alertText();
+await page.type("#deptNameInput", "Political Science");
+check("two-word name: PS", (await page.inputValue("#deptCodeInput")) === "PS", await page.inputValue("#deptCodeInput"));
+await page.fill("#deptCodeInput", "PHY");
+await page.click("#addDeptBtn");
+check("a code already in use is refused", /already the code of Physics/.test(await h.alertText()));
+await page.fill("#deptCodeInput", "POL"); await page.click("#addDeptBtn"); await h.alertText();
+await page.waitForFunction(() => /POL/.test(document.getElementById("deptList").textContent));
+const codes = []; await admin(async db => (await db.collection("departments").get()).forEach(d => codes.push(d.data().code)));
+check("codes stored: phy, pol", codes.sort().join() === "phy,pol", codes.join());
+
+await page.click("#instTabs button[data-tab=accounts]");
+await page.selectOption("#leaderRole", "HOD");
+await page.selectOption("#leaderDept", { label: "Physics" });
+await page.type("#leaderName", "Dr Ravi Kaul"); await settle();
+check("HOD login ID suggested: hod.phy", (await page.inputValue("#leaderLoginId")) === "hod.phy", await page.inputValue("#leaderLoginId"));
+await page.click("#addLeaderBtn");
+const hodPw = pw(await h.alertText());
+await page.selectOption("#leaderRole", "Principal"); await page.fill("#leaderName", ""); await page.type("#leaderName", "The Principal"); await settle();
+check("Principal login ID suggested: principal", (await page.inputValue("#leaderLoginId")) === "principal", await page.inputValue("#leaderLoginId"));
+await h.logout();
+
+log("HOD: teacher login IDs suggested");
+await h.loginFirst("hod.phy", hodPw);
+await page.evaluate(() => showSection("adminSection"));
+await page.click("#adminTabs button[data-tab=teachers]");
+const addTeacher = async name => {
+  await page.fill("#teacherNameInput", ""); await page.type("#teacherNameInput", name); await settle();
+  const id = await page.inputValue("#teacherUsernameInput");
+  await page.fill("#teacherPasswordInput", "start123");
+  await page.click("#addTeacherBtn"); await h.alertText();
+  return id;
+};
+const id1 = await addTeacher("Dr Asha Bhat");
+check("first teacher: phy.asha", id1 === "phy.asha", id1);
+const id2 = await addTeacher("Asha Wani");
+check("second Asha: phy.asha.wani", id2 === "phy.asha.wani", id2);
+await page.fill("#teacherNameInput", ""); await page.type("#teacherNameInput", "Imran Dar"); await settle();
+await page.fill("#teacherUsernameInput", "imran.d");
+await page.type("#teacherNameInput", " Sb"); await settle();
+check("a typed login ID is not overwritten", (await page.inputValue("#teacherUsernameInput")) === "imran.d");
+await page.fill("#teacherNameInput", "");
+await page.fill("#teacherUsernameInput", "");
+
+log("Excel upload without Username");
+const wb = XLSX.utils.book_new();
+XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet([{ Name: "Asha Mir" }, { Name: "Asha" }, { Name: "Owais Malik", Username: "owais.m", Password: "start123" }]), "T");
+XLSX.writeFile(wb, `${tmp}/teachers-ids.xlsx`);
+await page.setInputFiles("#teacherExcelFile", `${tmp}/teachers-ids.xlsx`);
+await page.click("#uploadTeacherExcelBtn");
+await page.waitForFunction(() => /Added/.test(document.getElementById("teacherUploadStatus").textContent), null, { timeout: 30000 });
+const up = await page.textContent("#teacherUploadStatus");
+check("Excel: 3 added; phy.asha.mir and phy.asha2 made, owais.m kept", /Added 3 teacher/.test(up) && /phy\.asha\.mir/.test(up) && /phy\.asha2/.test(up), up);
+const ids = []; await admin(async db => (await db.collection("teachers").get()).forEach(d => ids.push(d.data().username)));
+check("all five teachers stored with their IDs", ids.sort().join() === "owais.m,phy.asha,phy.asha.mir,phy.asha.wani,phy.asha2", ids.join());
+await page.screenshot({ path: `${SHOTS}/teacher-ids.png`, fullPage: true });
+await h.logout();
+
+log("Teacher logs in with the suggested ID");
+await h.loginFirst("phy.asha", "start123");
+check("phy.asha logged in", await page.isVisible("#attendanceSection.active"));
+const hint = await page.evaluate(() => document.querySelector("#loginScreen").textContent);
+check("login page explains the IDs", /roll number/.test(hint) && /phy\.asha/.test(hint));
+await h.logout();
+await h.finish();
