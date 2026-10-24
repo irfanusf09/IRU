@@ -32,9 +32,22 @@ const resetPw = async (roll, dob, pin, pw) => {
 };
 const inApp = () => page.waitForSelector("#appContainer", { state: "visible", timeout: 15000 }).then(() => true, () => false);
 
-log("HOD uploads students with dates of birth");
+log("A batch added in the Admin Panel appears in Student logins straight away");
 await h.login("hod.eco", "demo1234");
 await page.evaluate(() => showSection("adminSection"));
+await page.click("#adminTabs button[data-tab=logins]");
+await page.waitForSelector("#studentLoginBatchSelect option", { state: "attached" });
+await page.click("#adminTabs button[data-tab=batches]");
+await page.selectOption("#batchProgram", "UG");
+await page.evaluate(() => document.getElementById("batchProgram").dispatchEvent(new Event("change")));
+await page.fill("#batchYear", "2031"); await page.selectOption("#batchSemester", "1"); await page.click("#addBatchBtn");
+await page.waitForFunction(() => /Batch 2031/.test(document.getElementById("batchList").textContent));
+await page.click("#adminTabs button[data-tab=logins]");
+await page.waitForTimeout(800);
+check("new batch listed in Student logins without leaving the Admin Panel",
+  await page.$$eval("#studentLoginBatchSelect option", os => os.some(o => /UG Batch 2031/.test(o.textContent))));
+
+log("HOD uploads students with dates of birth");
 await page.click("#adminTabs button[data-tab=students]");
 await page.waitForFunction(() => document.querySelectorAll("#studentUploadSubjectSelect option[value]").length && document.getElementById("studentUploadSubjectSelect").value);
 const subjectId = await page.inputValue("#studentUploadSubjectSelect");
