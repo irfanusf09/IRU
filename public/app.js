@@ -409,6 +409,42 @@ App.autoLoginId = function (input, suggest) {
   };
 };
 
+// Former people (teachers, HODs, Principals) build up over the years, so they are kept
+// out of the main lists: a closed "Former (n)" panel with a search box, newest first.
+App.formerPanel = function (container, { key, title, people, when, text, row }) {
+  App._formerState = App._formerState || {};
+  const state = App._formerState[key] = App._formerState[key] || { open: false, q: "" };
+  const box = document.createElement("details");
+  box.className = "former-panel";
+  box.open = state.open;
+  box.innerHTML = `<summary>${App.esc(title)} (${people.length})</summary>
+    <input type="search" class="former-search" placeholder="Search by name or login ID">
+    <div class="former-results"></div>`;
+  const input = box.querySelector(".former-search"), out = box.querySelector(".former-results");
+  input.value = state.q;
+  const LIMIT = 25;
+  const draw = () => {
+    const q = state.q.trim().toLowerCase();
+    const found = people.filter(p => !q || text(p).toLowerCase().includes(q))
+      .sort((x, y) => String(when(y) || "").localeCompare(String(when(x) || "")));
+    out.innerHTML = "";
+    if (!found.length) { out.innerHTML = "<p><i>No one found.</i></p>"; return; }
+    const list = document.createElement("ul");
+    found.slice(0, LIMIT).forEach(p => list.appendChild(row(p)));
+    out.appendChild(list);
+    if (found.length > LIMIT) {
+      const more = document.createElement("p");
+      more.innerHTML = `<i>Showing the ${LIMIT} most recent of ${found.length}. Search by name or login ID to find others.</i>`;
+      out.appendChild(more);
+    }
+  };
+  box.addEventListener("toggle", () => { state.open = box.open; });
+  input.oninput = () => { state.q = input.value; draw(); };
+  draw();
+  container.appendChild(box);
+};
+App.formerSince = iso => iso ? `left ${App.esc(String(iso).slice(0, 10))}` : "left (date not recorded)";
+
 App.departmentName = async function (id) {
   return ((await App.getDepartments())[id || App.dept()] || {}).name || "";
 };
@@ -895,13 +931,14 @@ App.DEFAULT_EDIT_WINDOW = 60;   // minutes a teacher may change saved attendance
 App.getSettings = async function () {
   const now = Date.now();
   if (App._settingsCache && now - App._settingsCache.at < 60000) return App._settingsCache.value;
-  const value = { casualLeaveLimit: App.DEFAULT_CASUAL_LIMIT, editWindowMinutes: App.DEFAULT_EDIT_WINDOW };
+  const value = { casualLeaveLimit: App.DEFAULT_CASUAL_LIMIT, editWindowMinutes: App.DEFAULT_EDIT_WINDOW, attendanceFullMarksAt: 75 };
   try {
     const snap = await db.collection("config").doc("settings").get();
     const d = snap.exists ? snap.data() : {};
-    const limit = Number(d.casualLeaveLimit), win = Number(d.editWindowMinutes);
+    const limit = Number(d.casualLeaveLimit), win = Number(d.editWindowMinutes), full = Number(d.attendanceFullMarksAt);
     if (Number.isFinite(limit) && limit >= 0) value.casualLeaveLimit = limit;
     if (Number.isInteger(win) && win >= 0) value.editWindowMinutes = win;
+    if (Number.isFinite(full) && full > 0 && full <= 100) value.attendanceFullMarksAt = full;
   } catch (e) { App.readFailed("settings read failed", e); return value; }
   App._settingsCache = { at: now, value };
   return value;
@@ -1460,9 +1497,9 @@ App.Accounts.removeLogin = async function (uid, loginId) {
   await batch.commit();
 };
 
-App.Accounts.setActive = async function (uid, active) {
+App.Accounts.setActive = async function (uid, active, extra = {}) {
   if (!uid) return;
-  await db.collection("users").doc(uid).update({ active });
+  await db.collection("users").doc(uid).update({ active, ...extra });
 };
 
 // ---------- Teachers ----------
@@ -2089,6 +2126,7 @@ App.Settings.load = async function () {
   const set = (id, prop, v) => { const el = document.getElementById(id); if (el) el[prop] = v; };
   set("casualLeaveLimitInput", "value", s.casualLeaveLimit);
   set("editWindowInput", "value", s.editWindowMinutes);
+  set("attendanceFullMarksInput", "value", s.attendanceFullMarksAt);
   set("casualLeaveLimitShow", "textContent", s.casualLeaveLimit);
   set("editWindowShow", "textContent", s.editWindowMinutes ? `${s.editWindowMinutes} minutes` : "not allowed");
 };
@@ -2097,10 +2135,14 @@ App.Settings.save = async function () {
   const w = Number(document.getElementById("editWindowInput").value);
   if (!Number.isInteger(n) || n < 0 || n > 60) { UI.alert("Casual leaves: enter a whole number between 0 and 60."); return; }
   if (!Number.isInteger(w) || w < 0 || w > 180) { UI.alert("Changing saved attendance: enter whole minutes between 0 and 180."); return; }
+  const fullIn = document.getElementById("attendanceFullMarksInput");
+  const f = fullIn ? Number(fullIn.value) : 75;
+  if (!Number.isInteger(f) || f < 1 || f > 100) { UI.alert("Attendance marks: enter a whole percentage between 1 and 100."); return; }
   try {
-    await App.saveSettings({ casualLeaveLimit: n, editWindowMinutes: w });
+    await App.saveSettings({ casualLeaveLimit: n, editWindowMinutes: w, attendanceFullMarksAt: f });
     UI.alert(`Saved.\n\nCasual leaves: ${n} per subject per semester.\n` +
-      (w ? `Teachers can change saved attendance for ${w} minutes (never past midnight).` : "Teachers can't change saved attendance; corrections go to the HOD."));
+      (w ? `Teachers can change saved attendance for ${w} minutes (never past midnight).` : "Teachers can't change saved attendance; corrections go to the HOD.") +
+      `\nInternal assessment: full attendance marks at ${f}% or more.`);
   } catch (e) {
     console.error(e);
     UI.alert("Could not save. Check your internet connection and try again.");
@@ -2461,10 +2503,9 @@ App.Institution.renderLeaders = async function () {
     const [leaders, depts] = await Promise.all([App.Institution._leaders(), App.getDepartments()]);
     const me = (Auth.currentUser() || {}).uid;
     const order = { Admin: 0, Principal: 1, HOD: 2 };
-    const formerCount = leaders.filter(u => u.active === false).length;
-    const shown = leaders.filter(u => App._showFormerLeaders || u.active !== false);
-    const status = u => u.active !== false ? "Active"
-      : `<span style='color:#b91c1c'>${u.handedOverAt ? `Former (until ${App.esc(u.handedOverAt.slice(0, 10))}, then ${App.esc(u.handedOverTo || "")})` : "Deactivated"}</span>`;
+    const former = leaders.filter(u => u.active === false);
+    const shown = leaders.filter(u => u.active !== false);
+    const status = () => "Active";
     leaders.sort((a, b) => order[a.role] - order[b.role] ||
       String((depts[a.departmentId] || {}).name || "").localeCompare(String((depts[b.departmentId] || {}).name || "")));
     out.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
@@ -2480,15 +2521,27 @@ App.Institution.renderLeaders = async function () {
           : `<button data-reset="${App.esc(u.uid)}">Reset password</button>
              ${u.role === "HOD" || u.role === "Principal" ? `<button data-handover="${App.esc(u.uid)}">Hand over</button>` : ""}
              <button data-active="${App.esc(u.uid)}">Deactivate</button>`}</td>
-      </tr>`).join("") + "</table>" +
-      (formerCount ? `<p><a href="#" id="toggleFormerLeaders">${App._showFormerLeaders ? "Hide" : "Show"} former (${formerCount})</a></p>` : "");
-    const toggle = document.getElementById("toggleFormerLeaders");
-    if (toggle) toggle.onclick = e => { e.preventDefault(); App._showFormerLeaders = !App._showFormerLeaders; App.Institution.renderLeaders(); };
+      </tr>`).join("") + "</table>";
+    if (former.length) {
+      App.formerPanel(out, { key: "leaders", title: "Former HODs and Principals", people: former,
+        when: u => u.handedOverAt || u.deactivatedAt,
+        text: u => `${u.name} ${u.loginId || ""} ${u.formerLoginId || ""} ${(depts[u.departmentId] || {}).name || ""}`,
+        row: u => {
+          const li = document.createElement("li");
+          li.innerHTML = `${App.esc(u.name)} | ${App.esc(u.role)}${u.departmentId ? " — " + App.esc((depts[u.departmentId] || {}).name || u.departmentId) : ""}
+            | login ID: ${App.esc(u.loginId || "")} | ${App.formerSince(u.handedOverAt || u.deactivatedAt)}${u.handedOverTo ? `, handed over to ${App.esc(u.handedOverTo)}` : ""}
+            <button data-active="${App.esc(u.uid)}" style="margin-left:10px;">Reactivate</button>`;
+          return li;
+        } });
+    }
     out.querySelectorAll("button[data-handover]").forEach(b => b.onclick = () =>
       App.Institution.handOver(leaders.find(u => u.uid === b.dataset.handover)));
     out.querySelectorAll("button[data-reset]").forEach(b => b.onclick = () =>
       App.Institution.resetLeader(leaders.find(u => u.uid === b.dataset.reset)));
-    out.querySelectorAll("button[data-active]").forEach(b => b.onclick = async () => {
+    // (one handler for the list and the Former panel, whose rows are redrawn by its search)
+    out.onclick = async ev => {
+      const b = ev.target.closest("button[data-active]");
+      if (!b) return;
       const u = leaders.find(x => x.uid === b.dataset.active);
       const activate = u.active === false;
       const holder = activate && App.Institution._holder(leaders, u.role, u.departmentId);
@@ -2499,10 +2552,11 @@ App.Institution.renderLeaders = async function () {
       }
       if (!await UI.confirm(`${activate ? "Reactivate" : "Deactivate"} ${u.name}'s login?`,
         { okText: activate ? "Reactivate" : "Deactivate", danger: !activate })) return;
-      await App.Accounts.setActive(u.uid, activate);
+      await App.Accounts.setActive(u.uid, activate,
+        activate ? { deactivatedAt: firebase.firestore.FieldValue.delete() } : { deactivatedAt: new Date().toISOString() });
       App.Institution.renderLeaders();
       App.Institution.renderDepartments();
-    });
+    };
   } catch (e) {
     console.error(e);
     out.innerHTML = "<p style='color:red;'>Could not load logins.</p>";
@@ -2599,7 +2653,7 @@ App.Institution.handOver = async function (u) {
   }
   await UI.alert(`${post} handed over to ${newName}.\n\nLogin ID: ${loginId}\nStarting password: ${password}\n\n` +
     `Give these to ${newName}. They will choose their own password at first login.\n` +
-    `${u.name}'s account is kept as former (shown under "Show former").`);
+    `${u.name}'s account is kept as former (in the "Former HODs and Principals" panel).`);
   App.Institution.renderLeaders();
   App.Institution.renderDepartments();
 };
@@ -3708,14 +3762,13 @@ if (hasAttendance) {
       const teachers = await App.getTeachersFromFirestore();
       teacherList.innerHTML = "";
 
-      // Former teachers are kept (history) but hidden unless the HOD asks to see them
+      // Former teachers are kept (history) but listed apart: the "Former teachers" panel
       const isFormer = t => (t.status || "ACTIVE") === "FORMER";
-      const formerCount = teachers.filter(isFormer).length;
-      const visible = teachers
-        .filter(t => App._showFormerTeachers || !isFormer(t))
-        .sort((a, b) => (isFormer(a) - isFormer(b)) || String(a.name).localeCompare(String(b.name)));
+      const former = teachers.filter(isFormer);
+      const visible = teachers.filter(t => !isFormer(t))
+        .sort((a, b) => String(a.name).localeCompare(String(b.name)));
 
-      visible.forEach((t, index) => {
+      const makeRow = t => {
       const li = document.createElement("li");
       
       // 1. Determine Status (Default to ACTIVE if label is missing)
@@ -3754,7 +3807,7 @@ if (hasAttendance) {
   if (status === "FORMER") {
     if (await UI.confirm("Give this teacher access again?", { title: "Reactivate teacher?", okText: "Reactivate" })) {
       await db.collection("teachers").doc(t.id).update({
-       status: "ACTIVE"
+       status: "ACTIVE", formerSince: firebase.firestore.FieldValue.delete()
        });
       await App.Accounts.setActive(t.uid, true).catch(e => console.warn(e));
       renderTeachers();
@@ -3774,7 +3827,7 @@ if (hasAttendance) {
     // PROTECT HISTORY: Only Deactivation allowed
     if (await UI.confirm("This teacher has academic history, so the account is kept as FORMER (login stops working; records stay).", { title: "Deactivate teacher?", okText: "Deactivate", danger: true })) {
       await db.collection("teachers").doc(t.id).update({
-       status: "FORMER"
+       status: "FORMER", formerSince: new Date().toISOString()
        });
       await App.Accounts.setActive(t.uid, false).catch(e => console.warn(e));   // login stops working
       // Sever current assignments so they don't appear in active lists
@@ -3814,26 +3867,23 @@ if (hasAttendance) {
       li.appendChild(badge);
       li.appendChild(btn);
       if (status === "ACTIVE") li.appendChild(loginBtn);
-      teacherList.appendChild(li);
-    });
+      else {
+        const since = document.createElement("span");
+        since.style.marginLeft = "10px";
+        since.innerHTML = App.formerSince(t.formerSince);
+        li.insertBefore(since, btn);
+      }
+      return li;
+    };
+      visible.forEach(t => teacherList.appendChild(makeRow(t)));
 
-      if (formerCount > 0) {
-        const toggle = document.createElement("li");
-        toggle.style.background = "transparent";
-        toggle.style.border = "none";
-        const link = document.createElement("a");
-        link.href = "#";
-        link.id = "toggleFormerTeachers";
-        link.textContent = App._showFormerTeachers
-          ? `Hide former teachers (${formerCount})`
-          : `Show former teachers (${formerCount})`;
-        link.onclick = e => {
-          e.preventDefault();
-          App._showFormerTeachers = !App._showFormerTeachers;
-          renderTeachers();
-        };
-        toggle.appendChild(link);
-        teacherList.appendChild(toggle);
+      if (former.length) {
+        const holder = document.createElement("li");
+        holder.style.background = "transparent";
+        holder.style.border = "none";
+        App.formerPanel(holder, { key: "teachers", title: "Former teachers", people: former,
+          when: t => t.formerSince, text: t => `${t.name} ${t.loginId || t.username || ""}`, row: makeRow });
+        teacherList.appendChild(holder);
       }
   }
 
@@ -5701,6 +5751,7 @@ App.Student.init = async function () {
   if (!infoBox || !output) return;
 
   output.innerHTML = "<p>Loading your attendance…</p>";
+  App.IA.renderStudent();      // internal assessments load alongside
 
   try {
     const [batches, meSnap, mySubjects] = await Promise.all([
@@ -5860,12 +5911,14 @@ App.SECTION_RULES = {
     "correctionsSection",
     "recordsSection",
     "archiveSection",
-    "exitRegistrySection"
+    "exitRegistrySection",
+    "assessmentSection"
   ],
   Teacher: [
     "attendanceSection",
     "reportsSection",
-    "myRequestsSection"
+    "myRequestsSection",
+    "assessmentSection"
   ],
   Student: [
     "studentDashboardSection"     // dashboard includes "My day-by-day register"
@@ -6482,6 +6535,7 @@ if (id !== "archiveSection") {
 
   if (id === "correctionsSection") { App.CorrectionsPanel.init(); App.HODCorrections.init(); }
   if (id === "myRequestsSection") App.MyRequests.init();
+  if (id === "assessmentSection") App.IA.init();
   
   // ⚡ KEY FIXES: Match the names used in your specific app.js
   if (id === "recordsSection") { App.LeaveRegister.render(); App.CancelledClasses.init(); }

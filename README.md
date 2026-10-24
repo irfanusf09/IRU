@@ -12,9 +12,9 @@ There is no build step and no server code.
 |------|------|------|
 | **Institution Admin** | Every department | Adds departments; creates HOD and Principal logins; sets institution rules (casual leave limit); closes days for the whole institution; full backup |
 | **Principal** | Every department, view only | Institution Dashboard: per day, classes held / not held / not marked, present / absent / leave, who took which class |
-| **HOD** | Their department | Batches, subjects, teachers, students and their logins, closed days, correction decisions, reports, backup |
-| **Teacher** | Their subjects | Marks attendance once per class per day (and can change it for a short while, see below), records leave, requests corrections |
-| **Student** | Their own records | Dashboard and day-by-day register for all their subjects, from any department |
+| **HOD** | Their department | Batches, subjects, teachers, students and their logins, closed days, correction decisions, reports, backup; views internal assessment awards |
+| **Teacher** | Their subjects | Marks attendance once per class per day (and can change it for a short while, see below), records leave, requests corrections; internal assessment marks and awards |
+| **Student** | Their own records | Dashboard and day-by-day register for all their subjects, from any department; their internal assessments |
 
 The database rules (`firestore.rules`) enforce this on Google's servers, not just on screen.
 
@@ -33,9 +33,24 @@ servers check the time, so a phone's clock can't extend it.
 institution one active Principal. The Institution Admin uses **Hand over** on that person's
 row (Institution Setup → HOD & Principal logins): the successor gets the **same login ID**
 with a new password, and the former holder's account is kept, deactivated, under an
-archive ID (e.g. `hod.phy.until-2026-10-24`) and listed under **Show former**. What they did
+archive ID (e.g. `hod.phy.until-2026-10-24`) in the **Former** panel. What they did
 stays under their name: records now say who acted by name and login ID, e.g.
-"Dr Rafiq (hod.phy)". Former teachers are likewise listed only under **Show former teachers**.
+"Dr Rafiq (hod.phy)". Former teachers, HODs and Principals are kept in a separate **Former** panel (closed, with a
+search box, newest first), so the main lists show only current staff.
+
+**Internal assessment** (menu → Internal Assessment): the subject's teacher holds as many
+assessments as they like (presentation, viva, MCQ, written…), each with its own maximum
+and minimum marks and date, and enters marks per student or **Absent**. An *attendance*
+assessment is filled from recorded attendance: full marks at 75% or more (the Institution
+Admin can change the 75%), otherwise in proportion (50% → half the marks). The teacher
+ticks which assessments **count**; the total is their sum, rounded up. Below a minimum is
+FAIL, not appearing is ABSENT (0 in the total), and passing the total means PASS overall.
+Changing an assessment's maximum later rescales the marks already entered. The teacher
+chooses what to **share** with students (each assessment, and the award, separately);
+students always see which assessments they appeared in. The award downloads as Excel or
+PDF. Every entry and change is logged (who, when, old → new) and the log can't be
+edited. The HOD can only view. When the semester is closed nobody can change marks; if
+the HOD reopens it, they unlock.
 
 A department can teach students of other departments (e.g. a Minor): its HOD uploads the
 roll numbers, the students are found in their home department, and the offering HOD sees

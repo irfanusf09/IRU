@@ -36,14 +36,18 @@ const newPw = (msg.match(/Starting password: (\S+)/) || [])[1];
 check("successor gets the same login ID and a password", /Login ID: hod\.eco\b/.test(msg) && !!newPw, msg.slice(0, 120));
 await page.waitForFunction(() => /Dr New Eco/.test(document.getElementById("leaderList").textContent));
 // (the demo HOD is named "HOD Economics", which is also the Role + Department text, so rows are told apart by account)
-const rowOf = uid => page.$eval(`#leaderList button[data-active="${uid}"]`, b => b.closest("tr").textContent.replace(/\s+/g, " ").trim()).catch(() => null);
+const rowOf = uid => page.$eval(`#leaderList button[data-active="${uid}"]`, b => (b.closest("tr") || b.closest("li")).textContent.replace(/\s+/g, " ").trim()).catch(() => null);
 let r = await rows();
-check("list shows the new HOD, not the former one", r.some(x => /Dr New Eco/.test(x) && /hod\.eco /.test(x + " ")) && (await rowOf(ecoHod.uid)) === null, JSON.stringify(r));
-check("former one is behind a link", /Show former \(1\)/.test(await page.textContent("#leaderList")));
-await page.click("#toggleFormerLeaders");
+check("list shows the new HOD, not the former one", r.some(x => /Dr New Eco/.test(x) && /hod\.eco /.test(x + " ")) && !(await page.isVisible(`#leaderList button[data-active="${ecoHod.uid}"]`)), JSON.stringify(r));
+check("former one is in the closed Former panel", /Former HODs and Principals \(1\)/.test(await page.textContent("#leaderList .former-panel summary"))
+  && !(await page.$eval("#leaderList .former-panel", d => d.open)));
+await page.click("#leaderList .former-panel summary");
 await page.waitForSelector(`#leaderList button[data-active="${ecoHod.uid}"]`);
 const formerRow = (await rowOf(ecoHod.uid)) || "";
-check("former row: archive login ID, until today, then the successor", /hod\.eco\.until-\d{4}-\d{2}-\d{2}/.test(formerRow) && /then Dr New Eco/.test(formerRow), formerRow);
+check("former row: archive login ID, date left, successor", /hod\.eco\.until-\d{4}-\d{2}-\d{2}/.test(formerRow) && /left \d{4}-\d{2}-\d{2}/.test(formerRow) && /handed over to Dr New Eco/.test(formerRow), formerRow);
+await page.fill("#leaderList .former-search", "nobody-like-this");
+check("search narrows the Former panel", /No one found/.test(await page.textContent("#leaderList .former-results")));
+await page.fill("#leaderList .former-search", "until");
 await page.click(`button[data-active="${ecoHod.uid}"]`);
 msg = await h.alertText();
 check("former HOD can't be reactivated while the successor is active", /can't be reactivated/.test(msg), msg.slice(0, 100));

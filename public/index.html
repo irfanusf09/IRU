@@ -117,6 +117,7 @@
       <button onclick="showSection('correctionsSection')">📝 Corrections</button>
       <button onclick="showSection('myRequestsSection')">📝 My Requests</button>
       <button onclick="showSection('recordsSection')">🗂️ Leaves &amp; Cancelled Classes</button>
+      <button onclick="showSection('assessmentSection')">📋 Internal Assessment</button>
     </div>
 
     <div class="menu-group">
@@ -275,6 +276,14 @@
       <div id="myRequestsOutput"></div>
     </div>
 
+<!-- ================= Internal Assessment (teacher edits, HOD views) ================= -->
+<div id="assessmentSection" class="section">
+  <h1>Internal Assessment</h1>
+  <label for="iaSubject">Subject:</label>
+  <select id="iaSubject" style="max-width:100%;"></select>
+  <div id="iaBody" style="margin-top:12px;"></div>
+</div>
+
 <!-- ================= Defaulters ================= -->
 <div id="defaultersSection" class="section">
   <h1>Defaulters List (Below 75%)</h1>
@@ -300,6 +309,9 @@
 
   <h3>Subject-wise Attendance</h3>
   <div id="studentDashboardOutput"></div>
+
+  <h3 style="margin-top:25px;">My Internal Assessments</h3>
+  <div id="studentAssessmentOutput"></div>
 
   <div id="studentRegisterBox" style="display:none; margin-top:25px; padding-top:15px; border-top:1px solid #e2e8f0;">
     <h3>My day-by-day register</h3>
@@ -632,6 +644,10 @@
     <input type="number" id="editWindowInput" min="0" max="180" step="5" style="width:90px;"> minutes
     <p style="font-size:13px; color:#6b7280; margin-top:4px;">Never past midnight of that day. Every change is kept and marked † in registers.
       0 = no changes; corrections then always go to the HOD.</p>
+    <br>
+    <label for="attendanceFullMarksInput">Internal assessment, attendance marks: full marks at</label>
+    <input type="number" id="attendanceFullMarksInput" min="1" max="100" step="1" style="width:90px;"> % attendance or more
+    <p style="font-size:13px; color:#6b7280; margin-top:4px;">Below that, marks in proportion to attendance (e.g. 50% attendance → half the marks).</p>
     <button id="saveLeaveLimitBtn" onclick="App.Settings.save()" class="primary">Save rules</button>
     <p style="font-size:13px; color:#6b7280;">Minimum attendance: <b>75%</b> (all departments).</p>
 
@@ -703,6 +719,7 @@
 <script src="ui.js"></script>
 <script src="firebase-config.js"></script>
 <script src="app.js"></script>
+<script src="assessment.js"></script>
 <script src="pwa.js"></script>
 
 </body>
