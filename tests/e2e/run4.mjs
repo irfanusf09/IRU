@@ -102,7 +102,7 @@ await login("hod");
 const hodHeads = await visible("#sidebar .menu-heading");
 check("HOD sees all five headings", hodHeads.join(",") === "Daily,Reports,Records,Admin,Account", hodHeads.join(","));
 const hodItems = (await visible("#sidebar button[onclick]"));
-check("HOD has 9 screens in the menu", hodItems.length === 9, hodItems.join(" | "));
+check("HOD has 10 screens in the menu", hodItems.length === 10, hodItems.join(" | "));
 check("old items are gone", !hodItems.some(t => /Correction Requests|Correction Register|Cancelled Classes Log/.test(t)));
 await page.screenshot({ path: `${SHOTS}/menu-hod-desktop.png` });
 
@@ -140,7 +140,7 @@ await login("t1");
 const tHeads = await visible("#sidebar .menu-heading");
 check("Teacher sees Daily, Reports, Records, Account (no Admin)", tHeads.join(",") === "Daily,Reports,Records,Account", tHeads.join(","));
 const tItems = await visible("#sidebar button[onclick]");
-check("Teacher items: Attendance, Reports, My Requests", tItems.join(" | ") === "✅ Attendance | 📊 Reports | 📝 My Requests", tItems.join(" | "));
+check("Teacher items: Attendance, Reports, My Requests, Internal Assessment", tItems.join(" | ") === "✅ Attendance | 📊 Reports | 📝 My Requests | 📋 Internal Assessment", tItems.join(" | "));
 await page.click("#sidebar button:has-text('My Requests')");
 await page.waitForFunction(() => /Was present/.test(document.getElementById("myRequestsOutput").textContent), null, { timeout: 5000 });
 check("My Requests shows the teacher's request (approved)", /APPROVED/.test(await page.textContent("#myRequestsOutput")));

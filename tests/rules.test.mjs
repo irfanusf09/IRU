@@ -604,3 +604,65 @@ test("nobody can create a second HOD setup or an Admin account by themselves", a
   await assertFails(as("someone").doc("users/someone").set({ role: "Admin", active: true }));
   await assertFails(as("someone").doc("users/someone").set({ role: "HOD", departmentId: "ECO", active: true }));
 });
+
+// ---------- Internal assessment ----------
+const assessment = (subjectId, dept = "ECO") => ({ subjectId, departmentId: dept, components: [{ id: "c1", name: "Viva", max: 10, min: 4 }],
+  marks: { c1: { [ME]: 7 } }, final: { min: 0, shared: false }, updatedAt: "2026-10-24", updatedBy: "T1" });
+const view = (subjectId, studentId = ME, dept = "ECO") => ({ studentId, subjectId, departmentId: dept, subjectName: "Micro", semester: "3",
+  components: [{ name: "Viva", appeared: true }], final: null, updatedAt: "2026-10-24" });
+const logEntry = (uid, subjectId, dept = "ECO") => ({ subjectId, departmentId: dept, at: serverTime(), by: "Asha (t1)", byUid: uid,
+  action: "marks", componentId: "c1", componentName: "Viva", changes: [{ studentId: ME, from: null, to: 7 }], note: "" });
+
+test("internal assessment: only the subject's teacher enters marks, while the semester is active", async () => {
+  await assertSucceeds(as("t1").doc(`assessments/${SUBJECT}`).set(assessment(SUBJECT)));
+  await assertSucceeds(as("t1").doc(`assessmentViews/${ME}_${SUBJECT}`).set(view(SUBJECT)));
+  await assertFails(as("t2").doc(`assessments/${SUBJECT}`).set(assessment(SUBJECT)));                 // another teacher
+  await assertFails(as("hod").doc(`assessments/${SUBJECT}`).set(assessment(SUBJECT)));                // HOD: view only
+  await assertFails(as("admin").doc(`assessments/${SUBJECT}`).set(assessment(SUBJECT)));
+  await assertFails(as("t1").doc(`assessments/${CLOSED_SUBJECT}`).set(assessment(CLOSED_SUBJECT)));   // semester closed
+  await assertFails(as("t1").doc(`assessmentViews/${ME}_${CLOSED_SUBJECT}`).set(view(CLOSED_SUBJECT)));
+  await assertFails(as("t1").doc(`assessments/${SUBJECT}`).set({ ...assessment(SUBJECT), departmentId: "PHY" }));
+  await assertFails(as("t1").doc(`assessments/${SUBJECT}`).set({ ...assessment(SUBJECT), extra: 1 }));
+  await assertFails(as("t1").doc(`assessmentViews/${CLASSMATE}_${SUBJECT}`).set(view(SUBJECT)));       // ID must match the student
+  await assertFails(as("s1").doc(`assessmentViews/${ME}_${SUBJECT}`).set(view(SUBJECT)));              // students can't write
+  await assertFails(as("t1").doc(`assessments/${SUBJECT}`).delete());
+});
+
+test("internal assessment: reopening the semester unlocks it, closing locks it", async () => {
+  await env.withSecurityRulesDisabled(ctx => ctx.firestore().doc("batches/1700000000000_2").update({ status: "ACTIVE" }));
+  await assertSucceeds(as("t1").doc(`assessments/${CLOSED_SUBJECT}`).set(assessment(CLOSED_SUBJECT)));
+  await env.withSecurityRulesDisabled(ctx => ctx.firestore().doc("batches/1700000000000_2").update({ status: "CLOSED" }));
+  await assertFails(as("t1").doc(`assessments/${CLOSED_SUBJECT}`).update({ updatedAt: "later" }));
+});
+
+test("internal assessment: the teacher and the department's HOD read; a student reads only their own copy", async () => {
+  await env.withSecurityRulesDisabled(async ctx => {
+    const db = ctx.firestore();
+    await db.doc(`assessments/${SUBJECT}`).set(assessment(SUBJECT));
+    await db.doc(`assessmentViews/${ME}_${SUBJECT}`).set(view(SUBJECT));
+    await db.doc(`assessmentViews/${CLASSMATE}_${SUBJECT}`).set(view(SUBJECT, CLASSMATE));
+  });
+  await assertSucceeds(as("t1").doc(`assessments/${SUBJECT}`).get());
+  await assertSucceeds(as("hod").doc(`assessments/${SUBJECT}`).get());
+  await assertFails(as("t2").doc(`assessments/${SUBJECT}`).get());
+  await assertFails(as("hodphy").doc(`assessments/${SUBJECT}`).get());
+  await assertFails(as("s1").doc(`assessments/${SUBJECT}`).get());
+  await assertSucceeds(as("s1").doc(`assessmentViews/${ME}_${SUBJECT}`).get());
+  await assertSucceeds(as("s1").collection("assessmentViews").where("studentId", "==", ME).get());
+  await assertFails(as("s1").doc(`assessmentViews/${CLASSMATE}_${SUBJECT}`).get());
+  await assertFails(as("s1").collection("assessmentViews").where("subjectId", "==", SUBJECT).get());
+});
+
+test("internal assessment log: written by the subject's teacher at the server's time, never changed", async () => {
+  await assertSucceeds(as("t1").collection("assessmentLog").doc("l1").set(logEntry("t1", SUBJECT)));
+  await assertFails(as("t1").collection("assessmentLog").doc("l2").set({ ...logEntry("t1", SUBJECT), at: minutesAgo(60) }));
+  await assertFails(as("t1").collection("assessmentLog").doc("l3").set(logEntry("t2", SUBJECT)));     // pretending to be someone else
+  await assertFails(as("t2").collection("assessmentLog").doc("l4").set(logEntry("t2", SUBJECT)));
+  await assertFails(as("t1").collection("assessmentLog").doc("l5").set(logEntry("t1", CLOSED_SUBJECT)));
+  await assertFails(as("t1").doc("assessmentLog/l1").update({ note: "changed" }));
+  await assertFails(as("t1").doc("assessmentLog/l1").delete());
+  await assertFails(as("hod").doc("assessmentLog/l1").delete());
+  await assertSucceeds(as("hod").collection("assessmentLog").where("departmentId", "==", "ECO").where("subjectId", "==", SUBJECT).get());
+  await assertSucceeds(as("t1").collection("assessmentLog").where("subjectId", "==", SUBJECT).get());
+  await assertFails(as("s1").collection("assessmentLog").where("subjectId", "==", SUBJECT).get());
+});

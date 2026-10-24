@@ -24,6 +24,12 @@ rules_version = '2';
 //              is not ACTIVE); requests corrections; marks classes not held.
 //   Student  : reads only their own student record and their own
 //              attendance copies (studentViews), plus class-level data.
+//
+// Internal assessment (assessments, assessmentViews, assessmentLog): only the
+// subject's teacher enters marks, and only while its semester is ACTIVE (the HOD
+// reopening a semester unlocks it again). The HOD of the department may read.
+// Each student reads only their own copy (assessmentViews). Every entry or
+// change is logged in assessmentLog, which can't be changed or deleted.
 //   Anyone not logged in: can only look up a login ID (to sign in).
 //
 // Saved attendance can never be deleted. The teacher who saved it may change
@@ -370,6 +376,50 @@ service cloud.firestore {
                  resource.data.get("leaves", {}),
                  resource.data.get("corrections", {})));
       allow delete: if hodDeletes();
+    }
+
+    // ---------- Internal assessment ----------
+    // The subject's own teacher, for a subject of their department whose semester is ACTIVE
+    function assessmentWriteOk(subjectId, dept) {
+      let subject = get(doc("subjects", subjectId)).data;
+      return teaches(subjectId)
+        && dept is string && dept != "" && dept == myDept()
+        && subject.get("departmentId", "") == dept
+        && get(doc("batches", string(subject.batchId) + "_" + string(subject.semester))).data.get("status", "") == "ACTIVE";
+    }
+    function assessmentReadOk(data) {
+      return teaches(data.subjectId) || isHodOf(data.get("departmentId", ""));
+    }
+    match /assessments/{subjectId} {
+      allow read: if (resource == null && isStaff()) || (resource != null && assessmentReadOk(resource.data));
+      allow create, update: if request.resource.data.subjectId == subjectId
+        && request.resource.data.keys().hasOnly(["subjectId", "departmentId", "components", "marks", "final", "updatedAt", "updatedBy"])
+        && request.resource.data.components is list
+        && request.resource.data.marks is map
+        && (resource == null || resource.data.departmentId == request.resource.data.departmentId)
+        && assessmentWriteOk(subjectId, request.resource.data.get("departmentId", ""));
+      allow delete: if false;
+    }
+    match /assessmentViews/{viewId} {
+      allow read: if (isStudent() && resource != null && resource.data.studentId == me().studentDocId)
+        || (resource == null && isStaff())
+        || (resource != null && assessmentReadOk(resource.data));
+      allow create, update: if request.resource.data.studentId is string
+        && viewId == request.resource.data.studentId + "_" + request.resource.data.subjectId
+        && request.resource.data.keys().hasOnly(["studentId", "subjectId", "departmentId", "subjectName", "semester", "components", "final", "updatedAt"])
+        && (resource == null || resource.data.departmentId == request.resource.data.departmentId)
+        && assessmentWriteOk(request.resource.data.subjectId, request.resource.data.get("departmentId", ""));
+      allow delete: if false;
+    }
+    // Append-only: who changed which marks, when (the server's time)
+    match /assessmentLog/{id} {
+      allow read: if (resource == null && isStaff()) || (resource != null && assessmentReadOk(resource.data));
+      allow create: if request.resource.data.byUid == request.auth.uid
+        && request.resource.data.at == request.time
+        && request.resource.data.by is string
+        && request.resource.data.keys().hasOnly(["subjectId", "departmentId", "at", "by", "byUid", "action", "componentId", "componentName", "changes", "note"])
+        && assessmentWriteOk(request.resource.data.subjectId, request.resource.data.get("departmentId", ""));
+      allow update, delete: if false;
     }
 
     match /classCancellations/{docId} {
