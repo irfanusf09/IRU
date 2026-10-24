@@ -82,6 +82,6 @@ log("Teacher logs in with the suggested ID");
 await h.loginFirst("phy.asha", "start123");
 check("phy.asha logged in", await page.isVisible("#attendanceSection.active"));
 const hint = await page.evaluate(() => document.querySelector("#loginScreen").textContent);
-check("login page explains the IDs", /roll number/.test(hint) && /phy\.asha/.test(hint));
+check("login page explains the IDs", /roll number/.test(hint) && /login ID issued by the department/.test(hint));
 await h.logout();
 await h.finish();

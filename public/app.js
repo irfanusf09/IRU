@@ -1070,6 +1070,7 @@ App.StudentViews.rebuild = async function (onProgress) {
   leaves.forEach(l => { view(l.studentId, l.subjectId, l.departmentId).leaves[l.date] = l.type; });
 
   const writes = Object.entries(views).map(([id, data]) => ({ collection: "studentViews", id, data }));
+  const summaries = [];
 
   // Class summaries for the Principal's dashboard
   const [subjects, teachers] = await Promise.all([App.getSubjects(), App.getTeachersFromFirestore()]);
@@ -1080,15 +1081,18 @@ App.StudentViews.rebuild = async function (onProgress) {
     const leave = recs.filter(([sid, v]) => App.normalizeStatus(v) !== "Present" && onLeave.has(`${a.subjectId}_${a.date}_${sid}`)).length;
     const sub = subjects.find(s => String(s.id) === String(a.subjectId));
     const t = teachers.find(x => String(x.id) === String(a.markedBy));
-    writes.push({ collection: "classSummaries", id: `${a.subjectId}_${a.date}`, data: {
+    summaries.push({ collection: "classSummaries", id: `${a.subjectId}_${a.date}`, data: {
       departmentId: String(a.departmentId || ""), subjectId: String(a.subjectId), date: a.date,
       subjectName: sub ? sub.name : "", teacherId: String(a.markedBy || ""), teacherName: t ? t.name : "",
       present, leave, absent: recs.length - present - leave, markedAt: a.markedAt || ""
     } });
   });
 
-  if (onProgress) onProgress(`Saving ${writes.length} student copies and class summaries…`);
+  if (onProgress) onProgress(`Saving ${writes.length} student copies…`);
   await App.commitWrites(writes);
+  if (onProgress) onProgress(`Saving ${summaries.length} class summaries…`);
+  await App.commitWrites(summaries, 5,           // the rules check each against its attendance
+    n => onProgress && onProgress(`Saving class summaries… ${n} of ${summaries.length}`));
   App._viewsCache = null;
   return Object.keys(views).length;
 };
@@ -1142,14 +1146,22 @@ App.commitUpdates = async function (updates, onProgress) {
 };
 
 // Save many documents safely (Firestore allows max 500 writes per batch)
-App.commitWrites = async function (writes) {
-  // writes: [{ collection, id, data }]
-  for (let i = 0; i < writes.length; i += 400) {
-    const batch = db.batch();
-    writes.slice(i, i + 400).forEach(w => {
-      batch.set(db.collection(w.collection).doc(String(w.id)), w.data);
-    });
-    await batch.commit();
+// writes: [{ collection, id, data }]. perBatch: how many to save at once. Keep it
+// small when the database rules check each document against other documents:
+// Google allows only 20 such look-ups in one save and refuses the whole save
+// beyond that (a class summary uses 2, so at most 9 fit; 5 are saved at once).
+// Small saves run several at a time so large departments don't wait long.
+App.commitWrites = async function (writes, perBatch = 400, onProgress) {
+  const chunks = [];
+  for (let i = 0; i < writes.length; i += perBatch) chunks.push(writes.slice(i, i + perBatch));
+  const together = perBatch < 50 ? 8 : 1;
+  let done = 0;
+  for (let i = 0; i < chunks.length; i += together) {
+    await Promise.all(chunks.slice(i, i + together).map(chunk => {
+      const batch = db.batch();
+      chunk.forEach(w => batch.set(db.collection(w.collection).doc(String(w.id)), w.data));
+      return batch.commit().then(() => { done += chunk.length; if (onProgress) onProgress(done); });
+    }));
   }
 };
 
