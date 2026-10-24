@@ -140,6 +140,8 @@ const UI = (function () {
     });
     document.querySelectorAll("#adminSection .admin-tab").forEach(p => p.classList.toggle("active", p.dataset.tab === tab));
     try { sessionStorage.setItem("adminTab", tab); } catch (e) {}
+    // batches may have been added since the Admin Panel opened
+    if (tab === "logins" && typeof App !== "undefined" && App.Accounts && Auth.currentUser()) App.Accounts.loadStudentLoginBatches();
   }
   document.addEventListener("DOMContentLoaded", () => {
     const bar = document.getElementById("adminTabs");

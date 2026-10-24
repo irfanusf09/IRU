@@ -1562,6 +1562,7 @@ App.Accounts.loadStudentLoginBatches = async function () {
   if (!select) return;
   const batches = await App.getBatches();
   const seen = new Set();
+  const was = select.value;
   select.innerHTML = "";
   batches
     .filter(b => b.status !== "ARCHIVED")
@@ -1574,6 +1575,7 @@ App.Accounts.loadStudentLoginBatches = async function () {
       o.textContent = `${b.program} Batch ${b.year}`;
       select.appendChild(o);
     });
+  if (was && seen.has(was)) select.value = was;      // keep the HOD's choice
 };
 
 App.Accounts._batchInfo = async function (batchId) {
@@ -3620,6 +3622,7 @@ addBatchBtn.onclick = async () => {
   renderBatches();
   loadBatchesIntoSubjectSelect();
   loadBatchesForStudentUpload();
+  App.Accounts.loadStudentLoginBatches();
 };
 
   // ==========================
