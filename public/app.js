@@ -1593,16 +1593,24 @@ App.Accounts.renderStudentLogins = async function () {
   if (!students.length) { out.innerHTML = "<p>No students in this batch yet.</p>"; return; }
 
   const withLogin = students.filter(s => s.uid).length;
-  let html = `<p><b>${withLogin}</b> of <b>${students.length}</b> students have a login.</p>
+  const records = await App.Activation.records(students);
+  const noDob = students.filter(s => !s.uid && !records[App.Activation.idOf(s.roll)]).length;
+  let html = `<p><b>${withLogin}</b> of <b>${students.length}</b> students have a login.` +
+    (noDob ? ` ${noDob} without a login have no date of birth on record: upload it, or create logins for them below.` : "") + `</p>
     <table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
-    <tr><th>Roll</th><th>Name</th><th>Login ID</th><th>Status</th><th></th></tr>`;
+    <tr><th>Roll</th><th>Name</th><th>Login ID</th><th>Status</th><th>PIN</th><th></th></tr>`;
   students.forEach(st => {
     const id = st.loginId || App.Accounts.studentLoginId(st, batch);
+    const rec = records[App.Activation.idOf(st.roll)];
+    const when = rec && rec.activatedAt && rec.activatedAt.toDate ? " " + App.esc(rec.activatedAt.toDate().toLocaleString()) : "";
+    const status = st.uid ? (rec && rec.activatedAt ? `✅ Activated by the student${when}` : "✅ Has login")
+      : rec ? "Can activate (date of birth on record)" : "No login yet — no date of birth on record";
     html += `<tr>
       <td>${App.esc(st.roll)}</td>
       <td style="text-align:left;">${App.esc(st.name)}</td>
       <td>${st.uid ? App.esc(id) : "<i style='color:#888'>" + App.esc(id) + "</i>"}</td>
-      <td>${st.uid ? "✅ Has login" : "No login yet"}${st.status && st.status !== "ACTIVE" ? " (" + App.esc(st.status) + ")" : ""}</td>
+      <td>${status}${st.status && st.status !== "ACTIVE" ? " (" + App.esc(st.status) + ")" : ""}</td>
+      <td>${st.uid && rec ? (rec.hasPin ? "Set" : "Not yet") : "—"}</td>
       <td>${st.uid ? `<button data-reset="${App.esc(String(st.id))}">Reset password</button>` : ""}</td>
     </tr>`;
   });
@@ -1643,6 +1651,7 @@ App.Accounts.createStudentLogins = async function () {
         owner: { collection: "students", id: st.id, data: st }
       });
       created.push({ Roll: String(st.roll), Name: st.name, "Login ID": loginId, Password: password });
+      await App.Activation.loginMadeByHod(st);
     } catch (e) {
       console.error(e);
       problems.push(`${st.roll} ${st.name}: ${App.Accounts.errorText(e)}`);
@@ -1668,6 +1677,7 @@ App.Accounts.resetStudent = async function (studentId) {
       oldUid: st.uid,
       owner: { collection: "students", id: st.id, data: st }
     });
+    await App.Activation.loginMadeByHod(st, { clearPin: true });     // they choose a new PIN at their next login
     App.Accounts.showNewPasswords([{ Roll: String(st.roll), Name: st.name, "Login ID": loginId, Password: password }], [],
       `${batch.program} Batch ${batch.year}`);
   } catch (e) {
@@ -4587,9 +4597,20 @@ uploadExcelBtn.onclick = () => {
     const batchesNow = await App.getBatches();
     const uploadedSubject = allSubjects.find(s => String(s.id) === String(subjectId));
     const mayCreate = !uploadedSubject || App.isHomeSubject(uploadedSubject, batchesNow);
+    // Date of birth (optional): lets students activate their own login
+    const dobOf = row => {
+      const k = Object.keys(row).find(k => /^(dob|date ?of ?birth|birth ?date)$/i.test(k.trim().replace(/[_.]/g, " ")));
+      return k === undefined ? undefined : row[k];
+    };
     const rows = jsonData
-      .map(row => ({ name: String(row.name || row.Name || "").trim(), roll: String(row.roll || row.Roll || "").trim() }))
+      .map(row => ({ name: String(row.name || row.Name || "").trim(), roll: String(row.roll || row.Roll || "").trim(), dob: dobOf(row) }))
       .filter(r => r.name && r.roll);
+    const dobByRoll = {}, badDob = [];
+    rows.forEach(r => {
+      if (r.dob === undefined || r.dob === "") return;
+      const iso = App.Activation.parseDob(r.dob);
+      if (iso) dobByRoll[r.roll] = iso; else badDob.push(r.roll);
+    });
     // The same roll number in any department is the same student
     uploadStatus.textContent = "Checking roll numbers…";
     uploadStatus.style.color = "#555";
@@ -4667,12 +4688,25 @@ if (uploadedSubject) {
       uploadStatus.style.color = "red";
       return;
     }
+    // Dates of birth, for the department's own students only
+    const own = Object.values(known).filter(st => App.isOwnStudent(st) && dobByRoll[String(st.roll)]);
+    let dobSaved = 0;
+    try {
+      const dobWrites = await App.Activation.writesFor(own, dobByRoll);
+      await App.Activation.save(dobWrites);
+      dobSaved = dobWrites.length / 2;
+    } catch (e) {
+      console.error(e);
+      badDob.push("(dates of birth could not be saved — upload again)");
+    }
     uploadStatus.textContent = `Upload successful! ${newStudents.length} new student(s) added, ` +
       (fromOtherDepts ? `${fromOtherDepts} from other departments enrolled, ` : "") +
       `${touchedSubjects.size} subject(s) updated.` +
       (notFound.length ? ` Not added — no such roll number in any department: ${notFound.join(", ")}. ` +
-        `Their home department must add them first, then upload again.` : "");
-    uploadStatus.style.color = notFound.length ? "#b45309" : "green";
+        `Their home department must add them first, then upload again.` : "") +
+      (dobSaved ? ` ${dobSaved} date(s) of birth saved: those students can activate their own login.` : "") +
+      (badDob.length ? ` Date of birth not understood for: ${badDob.join(", ")} (write it like 14-03-2005).` : "");
+    uploadStatus.style.color = notFound.length || badDob.length ? "#b45309" : "green";
 
     loadSubjectsForStudentUpload(); 
     loadBatchesForStudentUpload(); 
@@ -6274,6 +6308,7 @@ App.enterApp = function (restoreLastSection) {
                  Principal: "principalSection", Legacy: "upgradeSection" }[role] || "attendanceSection";
   const last = restoreLastSection ? localStorage.getItem("lastSection") : null;
   showSection(last && App.canAccess(last) ? last : home);
+  if (role === "Student" && App.Activation) App.Activation.ensurePin();
 };
 
 // Called once at startup, when Firebase has restored (or not) the previous login

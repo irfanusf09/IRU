@@ -58,9 +58,31 @@
     📲 To install on iPhone/iPad: tap the <b>Share</b> button in Safari, then <b>Add to Home Screen</b>.
   </p>
   <p id="loginHint" style="font-size:12px; color:#6b7280;">Students sign in with their roll number; staff with the login ID issued by the department.</p>
+  <p style="font-size:13px;"><a href="#" id="activateLink">First time? Activate your account (students)</a></p>
+  <div id="activatePanel" class="login-panel" style="display:none;">
+    <p style="font-size:13px; margin-top:0;">Enter your roll number and date of birth, then choose a password and a
+      4-digit PIN. Keep the PIN private: with your date of birth, it lets you choose a new password if you forget it.</p>
+    <input id="actRoll" placeholder="Roll number" autocapitalize="none" autocomplete="username">
+    <input id="actDob" placeholder="Date of birth (DD-MM-YYYY)" inputmode="numeric">
+    <input type="password" id="actPw" placeholder="New password (at least 6 characters)" autocomplete="new-password">
+    <input type="password" id="actPw2" placeholder="Repeat the password" autocomplete="new-password">
+    <input type="password" id="actPin" placeholder="4-digit PIN" inputmode="numeric" maxlength="4" autocomplete="off">
+    <button id="actBtn" class="primary">Activate</button>
+    <p id="actMsg" style="font-size:13px;"></p>
+  </div>
   <p style="font-size:13px;"><a href="#" id="forgotLink">Forgot password?</a></p>
   <div id="forgotPanel" style="display:none; margin:8px 0; padding:10px; border:1px solid #ddd; border-radius:6px; background:#fff;">
-    <p style="font-size:13px; margin-top:0;">If you have confirmed a recovery email, enter it to get a reset link.
+    <p style="font-size:13px; margin-top:0;"><b>Students:</b> enter your roll number, date of birth and PIN, and choose a new password.</p>
+    <div class="login-panel" style="border:none; padding:0; margin:0 0 12px;">
+      <input id="resRoll" placeholder="Roll number" autocapitalize="none">
+      <input id="resDob" placeholder="Date of birth (DD-MM-YYYY)" inputmode="numeric">
+      <input type="password" id="resPin" placeholder="Your 4-digit PIN" inputmode="numeric" maxlength="4" autocomplete="off">
+      <input type="password" id="resPw" placeholder="New password (at least 6 characters)" autocomplete="new-password">
+      <input type="password" id="resPw2" placeholder="Repeat the password" autocomplete="new-password">
+      <button id="stuResetBtn">Set new password</button>
+      <p id="resMsg" style="font-size:13px;"></p>
+    </div>
+    <p style="font-size:13px;"><b>With a confirmed recovery email:</b> enter it to get a reset link.
        Otherwise, ask the HOD to reset your password.</p>
     <input type="email" id="forgotEmail" placeholder="Your recovery email" autocapitalize="none" style="display:block; width:100%; margin-bottom:8px;">
     <button id="forgotBtn">Send reset link</button>
@@ -445,7 +467,9 @@
   <div class="admin-tab" data-tab="logins" role="tabpanel">
 <h2>Student Logins</h2>
 <p style="font-size:13px; color:#6b7280;">
-  Each student logs in with their <b>roll number</b> as Login ID and a starting password that is
+  Each student logs in with their <b>roll number</b> as Login ID. Students whose <b>date of birth</b> was uploaded
+  (column "Date of birth" in the student list, e.g. 14-03-2005) activate their own login on the login screen and
+  choose a password and PIN — nothing to print. For others, create logins here: each gets a starting password,
   shown once, to print or download. (Logins created before departments keep their old ID too.)
 </p>
 <select id="studentLoginBatchSelect"></select>
@@ -719,6 +743,7 @@
 <script src="firebase-config.js"></script>
 <script src="app.js"></script>
 <script src="assessment.js"></script>
+<script src="activation.js"></script>
 <script src="pwa.js"></script>
 
 </body>

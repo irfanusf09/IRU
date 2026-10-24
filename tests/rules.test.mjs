@@ -5,6 +5,7 @@
 import { test, before, after, beforeEach } from "node:test";
 import fs from "node:fs";
 import { initializeTestEnvironment, assertSucceeds, assertFails } from "@firebase/rules-unit-testing";
+import crypto from "node:crypto";
 import firebase from "firebase/compat/app";
 import "firebase/compat/firestore";
 const serverTime = () => firebase.firestore.FieldValue.serverTimestamp();
@@ -665,4 +666,103 @@ test("internal assessment log: written by the subject's teacher at the server's 
   await assertSucceeds(as("hod").collection("assessmentLog").where("departmentId", "==", "ECO").where("subjectId", "==", SUBJECT).get());
   await assertSucceeds(as("t1").collection("assessmentLog").where("subjectId", "==", SUBJECT).get());
   await assertFails(as("s1").collection("assessmentLog").where("subjectId", "==", SUBJECT).get());
+});
+
+// ---------- Students set up their own login (roll number + date of birth, then a PIN) ----------
+const ROLL = "25001", DOB = "2005-03-14", PIN = "4821";
+const sha = s => crypto.createHash("sha256").update(s).digest("hex").toUpperCase();
+async function seedActivation({ activated = false, pin = null, uid = null } = {}) {
+  await env.withSecurityRulesDisabled(async ctx => {
+    const db = ctx.firestore();
+    await db.doc(`activation/${ROLL}`).set({ studentDocId: CLASSMATE, studentId: Number(CLASSMATE), departmentId: "ECO", activated, hasPin: !!pin });
+    await db.doc(`studentSecrets/${ROLL}`).set({ departmentId: "ECO", studentDocId: CLASSMATE, dobHash: sha(`${ROLL}|${DOB}`), pinHash: pin ? sha(`${ROLL}|${pin}`) : null });
+    await db.doc(`students/${CLASSMATE}`).set({ id: Number(CLASSMATE), roll: ROLL, departmentId: "ECO", ...(uid ? { uid, loginId: ROLL } : {}) });
+    if (uid) {
+      await db.doc(`users/${uid}`).set({ role: "Student", name: "", roll: ROLL, studentId: Number(CLASSMATE), studentDocId: CLASSMATE, departmentId: "ECO", loginId: ROLL, active: true, mustChangePassword: false });
+      await db.doc(`loginNames/${ROLL}`).set({ email: `${ROLL}.old@x`, uid, departmentId: "ECO" });
+    }
+  });
+}
+const profile = () => ({ role: "Student", name: "", roll: ROLL, studentId: Number(CLASSMATE), studentDocId: CLASSMATE, departmentId: "ECO",
+  loginId: ROLL, active: true, mustChangePassword: false, createdAt: "2026-10-24", activatedBy: "self" });
+// What the app saves when a student activates (newUid = the account they just created)
+function activationBatch(newUid, { dob = DOB, pin = PIN, roll = ROLL } = {}) {
+  const db = as(newUid), b = db.batch();
+  b.set(db.doc(`activationClaims/${newUid}`), { roll, dob, at: serverTime() });
+  b.set(db.doc(`users/${newUid}`), profile());
+  b.set(db.doc(`loginNames/${ROLL}`), { email: `${ROLL}.new@x`, uid: newUid, departmentId: "ECO" });
+  b.update(db.doc(`students/${CLASSMATE}`), { uid: newUid, loginId: ROLL });
+  b.update(db.doc(`activation/${ROLL}`), { activated: true, hasPin: true, activatedAt: serverTime() });
+  b.update(db.doc(`studentSecrets/${ROLL}`), { pinHash: sha(`${ROLL}|${pin}`), activatedAt: serverTime(), activatedUid: newUid });
+  return b.commit();
+}
+// What the app saves when a student resets with date of birth + PIN
+function resetBatch(newUid, oldUid, { dob = DOB, pin = PIN } = {}) {
+  const db = as(newUid), b = db.batch();
+  b.set(db.doc(`activationClaims/${newUid}`), { roll: ROLL, dob, pin, at: serverTime() });
+  b.set(db.doc(`users/${newUid}`), profile());
+  b.update(db.doc(`loginNames/${ROLL}`), { email: `${ROLL}.reset@x`, uid: newUid });
+  b.update(db.doc(`students/${CLASSMATE}`), { uid: newUid });
+  b.update(db.doc(`users/${oldUid}`), { active: false });
+  b.update(db.doc(`studentSecrets/${ROLL}`), { activatedAt: serverTime(), activatedUid: newUid });
+  return b.commit();
+}
+
+test("student activation: roll number + right date of birth works, once", async () => {
+  await seedActivation();
+  await assertFails(activationBatch("newA", { dob: "2005-03-15" }));        // wrong date of birth
+  await assertSucceeds(activationBatch("newB"));
+  await assertFails(activationBatch("newC"));                               // already activated
+  await assertSucceeds(as("newB").doc("activationClaims/newB").delete());  // the note is removed afterwards
+});
+
+test("student activation: can't claim someone else's record or a different profile", async () => {
+  await seedActivation();
+  const db = as("newD"), b = db.batch();
+  b.set(db.doc("activationClaims/newD"), { roll: ROLL, dob: DOB, at: serverTime() });
+  b.set(db.doc("users/newD"), { ...profile(), role: "HOD" });               // trying to become something else
+  b.set(db.doc(`loginNames/${ROLL}`), { email: "x@x", uid: "newD", departmentId: "ECO" });
+  await assertFails(b.commit());
+  await assertFails(as("newE").doc(`users/newE`).set(profile()));          // no proof at all
+  await seedActivation({ activated: true, uid: "existing" });               // HOD already made a login (slip)
+  await assertFails(activationBatch("newF"));
+});
+
+test("student reset: date of birth + PIN gives a new login and retires the old one", async () => {
+  await seedActivation({ activated: true, pin: PIN, uid: "oldU" });
+  await assertFails(resetBatch("newG", "oldU", { pin: "1111" }));           // wrong PIN
+  await assertFails(resetBatch("newH", "oldU", { dob: "2004-03-14" }));     // wrong date of birth
+  await assertSucceeds(resetBatch("newI", "oldU"));
+});
+
+test("student reset: impossible without a PIN, and can't retire another student's login", async () => {
+  await seedActivation({ activated: true, uid: "oldV" });                   // no PIN set yet
+  await assertFails(resetBatch("newJ", "oldV"));
+  await seedActivation({ activated: true, pin: PIN, uid: "oldW" });
+  const db = as("newK"), b = db.batch();
+  b.set(db.doc("activationClaims/newK"), { roll: ROLL, dob: DOB, pin: PIN, at: serverTime() });
+  b.update(db.doc("users/t1"), { active: false });                          // a teacher's account
+  await assertFails(b.commit());
+});
+
+test("date of birth and PIN can't be read; the HOD can clear a PIN but not set one", async () => {
+  await seedActivation({ activated: true, pin: PIN, uid: "oldX" });
+  await assertFails(as("hod").doc(`studentSecrets/${ROLL}`).get());
+  await assertFails(as("oldX").doc(`studentSecrets/${ROLL}`).get());
+  await assertFails(as("admin").doc(`studentSecrets/${ROLL}`).get());
+  await assertSucceeds(as("someone").doc(`activation/${ROLL}`).get());      // public: only "activated or not"
+  await assertFails(as("someone").collection("activation").get());          // but no listing
+  await assertSucceeds(as("hod").doc(`studentSecrets/${ROLL}`).update({ pinHash: null }));
+  await assertFails(as("hod").doc(`studentSecrets/${ROLL}`).update({ pinHash: sha(`${ROLL}|0000`) }));
+  await env.withSecurityRulesDisabled(ctx => ctx.firestore().doc(`studentSecrets/${ROLL}`).update({ pinHash: sha(`${ROLL}|${PIN}`) }));
+  await assertSucceeds(as("hod").doc(`studentSecrets/${ROLL}`).set({ dobHash: sha(`${ROLL}|2005-03-15`) }, { merge: true }));   // re-upload keeps the PIN
+  await assertFails(as("hodphy").doc(`studentSecrets/${ROLL}`).update({ pinHash: null }));
+});
+
+test("a logged-in student sets their own PIN, nobody else's", async () => {
+  await seedActivation({ activated: true, uid: "oldY" });
+  await assertSucceeds(as("oldY").doc(`studentSecrets/${ROLL}`).update({ pinHash: sha(`${ROLL}|${PIN}`) }));
+  await assertSucceeds(as("oldY").doc(`activation/${ROLL}`).update({ hasPin: true }));
+  await assertFails(as("s1").doc(`studentSecrets/${ROLL}`).update({ pinHash: sha(`${ROLL}|9999`) }));
+  await assertFails(as("oldY").doc(`studentSecrets/${ROLL}`).update({ dobHash: "X" }));
 });

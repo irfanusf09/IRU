@@ -6,7 +6,7 @@ import { HERE, TOOLS } from "./paths.mjs";
 
 const PROJECT = "demo-attendance";
 const RUNS = ["run.mjs", "run2.mjs", "run3.mjs", "run4.mjs", "run5-excel.mjs", "run6-multi.mjs", "run7-upgrade.mjs",
-  "run8-security.mjs", "run9-demo.mjs", "run10-edit.mjs", "run11-ids.mjs", "run12-reset.mjs", "run14-lazy.mjs", "run15-offline.mjs", "run16-backup.mjs", "run17-appcheck.mjs", "run18-handover.mjs", "run19-assessment.mjs", "run20-rebuild.mjs"];
+  "run8-security.mjs", "run9-demo.mjs", "run10-edit.mjs", "run11-ids.mjs", "run12-reset.mjs", "run14-lazy.mjs", "run15-offline.mjs", "run16-backup.mjs", "run17-appcheck.mjs", "run18-handover.mjs", "run19-assessment.mjs", "run20-rebuild.mjs", "run21-activation.mjs"];
 const only = process.argv.slice(2);
 
 for (const tool of ["demo-seed", "reset-login", "backup"]) {

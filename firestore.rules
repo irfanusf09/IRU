@@ -32,6 +32,12 @@ rules_version = '2';
 // change is logged in assessmentLog, which can't be changed or deleted.
 //   Anyone not logged in: can only look up a login ID (to sign in).
 //
+// Students may set up their own login (no slips): roll number + date of birth
+// activates it once, and they choose a password and a 4-digit PIN. Later,
+// roll number + date of birth + PIN lets them choose a new password. The date of
+// birth and PIN are kept only as SHA-256 hashes in studentSecrets, which nobody
+// can read; these rules compare them with what the student typed.
+//
 // Saved attendance can never be deleted. The teacher who saved it may change
 // the marks for a short time (Institution Admin's setting, default 60 minutes,
 // never past midnight); the first-saved marks are kept, so every change shows.
@@ -155,6 +161,84 @@ service cloud.firestore {
             || leaves[last] == get(doc("leaves", v.subjectId + "_" + last + "_" + v.studentId)).data.type);
     }
 
+    // ---------- Students setting up their own login ----------
+    // The student types roll number + date of birth (+ PIN to reset) into a note
+    // (activationClaims/{their new uid}) written in the same save; checked here
+    // against the hashes, then deleted by them.
+    function claim() { return getAfter(doc("activationClaims", request.auth.uid)).data; }
+    function stubOf(id) { return get(doc("activation", id)).data; }
+    function secretOf(id) { return get(doc("studentSecrets", id)).data; }
+    function dobOk(id) {
+      return signedIn() && existsAfter(doc("activationClaims", request.auth.uid))
+        && claim().roll == id && claim().dob is string
+        && exists(doc("studentSecrets", id))
+        && hashing.sha256(id + "|" + claim().dob).toHexString() == secretOf(id).dobHash;
+    }
+    // first time: not activated yet, date of birth matches
+    function activates(id) { return dobOk(id) && stubOf(id).activated == false; }
+    // forgot password: activated, date of birth and PIN match
+    function resets(id) {
+      return dobOk(id) && stubOf(id).activated == true && claim().pin is string
+        && secretOf(id).get("pinHash", null) is string
+        && hashing.sha256(id + "|" + claim().pin).toHexString() == secretOf(id).pinHash;
+    }
+    function selfSetup(id) { return activates(id) || resets(id); }
+    // The student's own new profile, exactly as the activation record says
+    function selfProfileOk(uid, p) {
+      let id = p.loginId;
+      let stub = stubOf(id);
+      return uid == request.auth.uid
+        && p.keys().hasOnly(["role", "name", "roll", "studentId", "studentDocId", "departmentId", "loginId", "active", "mustChangePassword", "createdAt", "activatedBy"])
+        && p.role == "Student" && p.name == "" && p.active == true && p.mustChangePassword == false
+        && p.studentDocId == stub.studentDocId && p.studentId == stub.studentId && p.departmentId == stub.departmentId
+        && selfSetup(id)
+        && getAfter(doc("loginNames", id)).data.uid == uid;
+    }
+
+    match /activation/{id} {
+      allow get: if true;
+      allow list: if false;
+      allow create: if hodCreates()
+        && request.resource.data.keys().hasOnly(["studentDocId", "studentId", "departmentId", "activated", "hasPin"]);
+      allow update: if (hodUpdates()
+            && request.resource.data.keys().hasOnly(["studentDocId", "studentId", "departmentId", "activated", "hasPin", "activatedAt"]))
+        || (activates(id)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["activated", "hasPin", "activatedAt"])
+            && request.resource.data.activated == true && request.resource.data.hasPin == true
+            && request.resource.data.activatedAt == request.time)
+        // a student sets their PIN after logging in
+        || (isStudent() && me().get("loginId", "") == id
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["hasPin"])
+            && request.resource.data.hasPin == true);
+      allow delete: if hodDeletes();
+    }
+    match /studentSecrets/{id} {
+      allow read: if false;
+      allow create: if hodCreates()
+        && request.resource.data.keys().hasOnly(["departmentId", "studentDocId", "dobHash", "pinHash"]);
+      allow update: if (hodUpdates()
+            && request.resource.data.keys().hasOnly(["departmentId", "studentDocId", "dobHash", "pinHash", "activatedAt", "activatedUid"])
+            && (request.resource.data.get("pinHash", null) == null           // the HOD may clear a PIN or leave it, not set one
+                || request.resource.data.get("pinHash", null) == resource.data.get("pinHash", null)))
+        || (selfSetup(id)
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["pinHash", "activatedAt", "activatedUid"])
+            && request.resource.data.activatedUid == request.auth.uid
+            && request.resource.data.activatedAt == request.time
+            && (activates(id) ? request.resource.data.get("pinHash", null) is string
+                              : request.resource.data.get("pinHash", null) == resource.data.get("pinHash", null)))
+        || (isStudent() && me().get("loginId", "") == id
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["pinHash"])
+            && request.resource.data.pinHash is string);
+      allow delete: if hodDeletes();
+    }
+    match /activationClaims/{uid} {
+      allow read, update: if false;
+      allow create: if request.auth != null && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(["roll", "dob", "pin", "at"])
+        && request.resource.data.at == request.time;
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
     // ---------- Institution ----------
     match /config/institution {
       allow get: if true;
@@ -197,11 +281,16 @@ service cloud.firestore {
       allow list: if isAdmin() || (isHod() && resource.data.get("departmentId", "") == myDept() && myDept() != "");
       allow create: if isAdmin()
         || hodManagesAccount(request.resource.data)
-        || (request.resource.data.role == "Admin" && setupAppoints(uid));
+        || (request.resource.data.role == "Admin" && setupAppoints(uid))
+        || (!hasProfile() && selfProfileOk(uid, request.resource.data));
       // A user may also clear their own "must change password" flag and
       // record their own recovery email.
       allow update: if isAdmin()
         || (hodManagesAccount(resource.data) && hodManagesAccount(request.resource.data))
+        // a student resetting their own password retires their old login
+        || (resource.data.role == "Student" && resets(resource.data.get("loginId", ""))
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["active"])
+            && request.resource.data.active == false)
         || (signedIn()
             && request.auth.uid == uid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["mustChangePassword", "recoveryEmail"])
@@ -217,8 +306,13 @@ service cloud.firestore {
       allow list: if false;
       allow create: if isAdmin()
         || hodCreates()
-        || setupAppoints(request.resource.data.uid);
-      allow update: if isAdmin() || hodUpdates();
+        || setupAppoints(request.resource.data.uid)
+        || (activates(loginId) && request.resource.data.uid == request.auth.uid
+            && request.resource.data.keys().hasOnly(["email", "uid", "departmentId"])
+            && request.resource.data.departmentId == stubOf(loginId).departmentId);
+      allow update: if isAdmin() || hodUpdates()
+        || (resets(loginId) && request.resource.data.uid == request.auth.uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["email", "uid"]));
       allow delete: if isAdmin() || hodDeletes();
     }
 
@@ -286,7 +380,13 @@ service cloud.firestore {
     match /students/{id} {
       allow read: if isStaff() || seesAll() || (isStudent() && me().studentDocId == id);
       allow create: if hodCreates();
-      allow update: if hodUpdates() || claimsLegacy();
+      allow update: if hodUpdates() || claimsLegacy()
+        // the student's own login, set up by themselves
+        || (request.resource.data.get("uid", "") == request.auth.uid
+            && selfSetup(request.resource.data.get("loginId", ""))
+            && stubOf(request.resource.data.loginId).studentDocId == id
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["uid", "loginId"])
+            && (resets(request.resource.data.loginId) || resource.data.get("uid", null) == null));
       allow delete: if hodDeletes();
     }
 
