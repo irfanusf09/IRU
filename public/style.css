@@ -669,3 +669,7 @@ details.dept-classes summary { cursor: pointer; }
 .ia-absent { color: #92400e; font-weight: 600; }
 .ia-card { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; margin-bottom: 12px; background: var(--panel); }
 .ia-card h4 { margin: 4px 0; }
+
+/* Login screen: student activation / reset fields */
+.login-panel { margin: 8px 0; padding: 10px; border: 1px solid #ddd; border-radius: 6px; background: #fff; }
+.login-panel input { display: block; width: 100%; margin-bottom: 8px; box-sizing: border-box; }

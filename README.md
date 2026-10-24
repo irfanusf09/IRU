@@ -23,6 +23,17 @@ The database rules (`firestore.rules`) enforce this on Google's servers, not jus
 then `phy.asha.bhat` or `phy.asha2` if taken). The Institution Admin sets each department's
 short code. Logins created earlier keep their IDs.
 
+**Student logins without slips:** when the HOD's student list includes a **Date of birth**
+column (e.g. `14-03-2005`; Excel date cells work too), students activate their own login on
+the login screen (*First time? Activate your account*): roll number + date of birth, then
+they choose a password and a 4-digit **PIN**. If they forget the password, *Forgot password?*
+→ roll number + date of birth + PIN lets them choose a new one. Activation works once; if
+someone else got there first, the student tells the HOD, who resets the login. Dates of
+birth and PINs are stored only as one-way hashes that nobody can read (not even the HOD);
+Google's servers check them. Students who got a login from the HOD (slips) are asked to
+choose a PIN at their next login; an HOD reset clears the PIN, so they choose a new one.
+Admin Panel → Student logins shows who has activated and who has a PIN.
+
 **Changing saved attendance:** the teacher who saved a class can change its marks for a
 while afterwards (late arrivals, mistakes) — 60 minutes by default, set by the Institution
 Admin (0–180), and never past midnight. The first-saved marks are kept; changed entries
