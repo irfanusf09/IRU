@@ -114,6 +114,13 @@ Auth.currentUser = function () {
   }
 };
 Auth.isLoggedIn = function () { return !!Auth.currentUser(); };
+// For "done by" on records: name and login ID. An HOD's or Principal's login ID
+// passes to their successor, so the ID alone would not say who it was.
+Auth.actorLabel = function (fallback = "") {
+  const u = Auth.currentUser() || {};
+  const id = u.loginId || u.username || fallback;
+  return u.name ? `${u.name} (${id})` : id;
+};
 Auth.logout = function () {
   localStorage.removeItem("currentUser");
   localStorage.removeItem("lastSection");
@@ -2332,6 +2339,12 @@ App.Institution.init = async function () {
   }
 };
 
+// The active holder of a post (HOD of a department, or Principal), if any
+App.Institution._holder = (leaders, role, departmentId) =>
+  leaders.find(u => u.active !== false && u.role === role && (role !== "HOD" || u.departmentId === departmentId));
+App.Institution._postName = async (role, departmentId) =>
+  role === "HOD" ? `HOD of ${await App.departmentName(departmentId) || departmentId}` : role;
+
 App.Institution._leaders = async function () {
   const list = [];
   (await db.collection("users").where("role", "in", ["HOD", "Principal", "Admin"]).get())
@@ -2448,24 +2461,42 @@ App.Institution.renderLeaders = async function () {
     const [leaders, depts] = await Promise.all([App.Institution._leaders(), App.getDepartments()]);
     const me = (Auth.currentUser() || {}).uid;
     const order = { Admin: 0, Principal: 1, HOD: 2 };
+    const formerCount = leaders.filter(u => u.active === false).length;
+    const shown = leaders.filter(u => App._showFormerLeaders || u.active !== false);
+    const status = u => u.active !== false ? "Active"
+      : `<span style='color:#b91c1c'>${u.handedOverAt ? `Former (until ${App.esc(u.handedOverAt.slice(0, 10))}, then ${App.esc(u.handedOverTo || "")})` : "Deactivated"}</span>`;
     leaders.sort((a, b) => order[a.role] - order[b.role] ||
       String((depts[a.departmentId] || {}).name || "").localeCompare(String((depts[b.departmentId] || {}).name || "")));
     out.innerHTML = `<table border="1" cellpadding="5" width="100%" style="border-collapse:collapse;">
       <tr><th style="text-align:left;">Name</th><th>Role</th><th>Department</th><th>Login ID</th><th>Status</th><th></th></tr>` +
-      leaders.map(u => `<tr>
+      shown.map(u => `<tr>
         <td style="text-align:left;">${App.esc(u.name)}</td>
         <td>${App.esc(u.role === "Admin" ? "Institution Admin" : u.role)}</td>
         <td>${App.esc((depts[u.departmentId] || {}).name || (u.departmentId ? u.departmentId : "—"))}</td>
         <td>${App.esc(u.loginId || "")}</td>
-        <td>${u.active === false ? "<span style='color:#b91c1c'>Deactivated</span>" : "Active"}</td>
-        <td>${u.uid === me ? "<i>you</i>" : `<button data-reset="${App.esc(u.uid)}">Reset password</button>
-             <button data-active="${App.esc(u.uid)}">${u.active === false ? "Reactivate" : "Deactivate"}</button>`}</td>
-      </tr>`).join("") + "</table>";
+        <td>${status(u)}</td>
+        <td>${u.uid === me ? "<i>you</i>" : u.active === false
+          ? `<button data-active="${App.esc(u.uid)}">Reactivate</button>`
+          : `<button data-reset="${App.esc(u.uid)}">Reset password</button>
+             ${u.role === "HOD" || u.role === "Principal" ? `<button data-handover="${App.esc(u.uid)}">Hand over</button>` : ""}
+             <button data-active="${App.esc(u.uid)}">Deactivate</button>`}</td>
+      </tr>`).join("") + "</table>" +
+      (formerCount ? `<p><a href="#" id="toggleFormerLeaders">${App._showFormerLeaders ? "Hide" : "Show"} former (${formerCount})</a></p>` : "");
+    const toggle = document.getElementById("toggleFormerLeaders");
+    if (toggle) toggle.onclick = e => { e.preventDefault(); App._showFormerLeaders = !App._showFormerLeaders; App.Institution.renderLeaders(); };
+    out.querySelectorAll("button[data-handover]").forEach(b => b.onclick = () =>
+      App.Institution.handOver(leaders.find(u => u.uid === b.dataset.handover)));
     out.querySelectorAll("button[data-reset]").forEach(b => b.onclick = () =>
       App.Institution.resetLeader(leaders.find(u => u.uid === b.dataset.reset)));
     out.querySelectorAll("button[data-active]").forEach(b => b.onclick = async () => {
       const u = leaders.find(x => x.uid === b.dataset.active);
       const activate = u.active === false;
+      const holder = activate && App.Institution._holder(leaders, u.role, u.departmentId);
+      if (holder) {
+        UI.alert(`${await App.Institution._postName(u.role, u.departmentId)} is now ${holder.name}. ` +
+          `There can be only one; ${u.name} can't be reactivated while ${holder.name} is active.`);
+        return;
+      }
       if (!await UI.confirm(`${activate ? "Reactivate" : "Deactivate"} ${u.name}'s login?`,
         { okText: activate ? "Reactivate" : "Deactivate", danger: !activate })) return;
       await App.Accounts.setActive(u.uid, activate);
@@ -2486,6 +2517,15 @@ App.Institution.addLeader = async function () {
   if (role === "HOD" && !departmentId) { UI.alert("Add the department first."); return; }
   if (!name) { UI.alert("Enter the name."); return; }
   if (!Auth.isValidLoginId(loginId)) { UI.alert("Login ID can use only letters, numbers, dots and dashes."); return; }
+  if (role === "HOD" || role === "Principal") {
+    const holder = App.Institution._holder(await App.Institution._leaders(), role, departmentId);
+    if (holder) {
+      UI.alert(`${await App.Institution._postName(role, departmentId)} is already ${holder.name} (${holder.loginId}).\n\n` +
+        `There can be only one. When someone takes over, use "Hand over" on ${holder.name}'s row: ` +
+        `the new person gets the same login ID, and ${holder.name}'s records stay under their name.`);
+      return;
+    }
+  }
   if (await App.Accounts.loginIdOwner(loginId)) { UI.alert(`Login ID "${loginId}" is already used.`); return; }
   const password = Auth.generatePassword();
   const btn = document.getElementById("addLeaderBtn");
@@ -2503,6 +2543,63 @@ App.Institution.addLeader = async function () {
   } finally {
     btn.disabled = false;
   }
+  App.Institution.renderLeaders();
+  App.Institution.renderDepartments();
+};
+
+App.Institution.handOver = async function (u) {
+  const post = await App.Institution._postName(u.role, u.departmentId);
+  const typed = await UI.prompt(`Who takes over as ${post} from ${u.name}?\n\nName of the new ${u.role === "HOD" ? "HOD" : "Principal"}:`);
+  if (typed === null) return;
+  const newName = typed.trim();
+  if (!newName) { UI.alert("Enter the new person's name."); return; }
+  const loginId = u.loginId;
+  if (!(await UI.confirm(`Hand over ${post} from ${u.name} to ${newName}?\n\n` +
+    `• ${newName} gets the login ID "${loginId}" with a new password.\n` +
+    `• ${u.name}'s login stops working. Their account and everything they did stay, under their name.`,
+    { title: "Hand over?", okText: "Hand over", danger: true }))) return;
+
+  // The former holder keeps their account under an archive ID
+  const today = new Date().toLocaleDateString("en-CA");
+  let archiveId = `${loginId}.until-${today}`.slice(0, 42).replace(/[._-]+$/, "");
+  for (let n = 2; await App.Accounts.loginIdOwner(archiveId); n++) archiveId = `${loginId}.until-${today}-${n}`.slice(0, 42);
+  const nameDoc = await db.collection("loginNames").doc(loginId).get();
+  if (!nameDoc.exists || nameDoc.data().uid !== u.uid) { UI.alert("This login has changed meanwhile. Reload the page and try again."); return; }
+  const now = new Date().toISOString();
+  const release = db.batch();
+  release.update(db.collection("users").doc(u.uid),
+    { active: false, loginId: archiveId, formerLoginId: loginId, handedOverAt: now, handedOverTo: newName });
+  release.set(db.collection("loginNames").doc(archiveId), nameDoc.data());
+  release.delete(db.collection("loginNames").doc(loginId));
+  try {
+    await release.commit();
+  } catch (e) {
+    console.error(e);
+    UI.alert("Could not hand over. Check the internet connection and try again. Nothing was changed.");
+    return;
+  }
+
+  const password = Auth.generatePassword();
+  try {
+    await App.Accounts.issueLogin({ loginId, password,
+      profile: { role: u.role, name: newName, departmentId: u.departmentId || "", tookOverFrom: u.name, tookOverAt: now } });
+  } catch (e) {
+    console.error(e);
+    // Put the former holder back, so the post is never left without a working login
+    const undo = db.batch();
+    undo.update(db.collection("users").doc(u.uid),
+      { active: true, loginId, formerLoginId: firebase.firestore.FieldValue.delete(),
+        handedOverAt: firebase.firestore.FieldValue.delete(), handedOverTo: firebase.firestore.FieldValue.delete() });
+    undo.set(db.collection("loginNames").doc(loginId), nameDoc.data());
+    undo.delete(db.collection("loginNames").doc(archiveId));
+    await undo.commit().catch(err => console.error(err));
+    UI.alert(App.Accounts.errorText(e) + `\n\nNothing was handed over; ${u.name} still holds "${loginId}".`);
+    App.Institution.renderLeaders();
+    return;
+  }
+  await UI.alert(`${post} handed over to ${newName}.\n\nLogin ID: ${loginId}\nStarting password: ${password}\n\n` +
+    `Give these to ${newName}. They will choose their own password at first login.\n` +
+    `${u.name}'s account is kept as former (shown under "Show former").`);
   App.Institution.renderLeaders();
   App.Institution.renderDepartments();
 };
@@ -3136,7 +3233,7 @@ App.Closures.bind = function (els) {
       date,
       type,
       reason,
-      markedBy: (Auth.currentUser() || {}).loginId || App.role(),
+      markedBy: Auth.actorLabel(App.role()),
       timestamp: new Date().toISOString()
     });
     els.btn.disabled = false;
@@ -3269,7 +3366,7 @@ App.setBatchStatus = async function (batchId, semester, status) {
   if (batch) {
   // Keep a trail of every status change (who / when)
   const history = Array.isArray(batch.statusHistory) ? batch.statusHistory : [];
-  history.push({ status, at: new Date().toISOString(), by: (Auth.currentUser() || {}).loginId || "HOD" });
+  history.push({ status, at: new Date().toISOString(), by: Auth.actorLabel("HOD") });
   batch.statusHistory = history;
   batch.status = status;
 
@@ -6506,12 +6603,12 @@ const req = doc.data();
   decision: "Approved",
   reason: req.reason,
   requestedBy: req.requestedBy,
-  approvedBy: user.username || "HOD",
+  approvedBy: Auth.actorLabel("HOD"),
   departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
   req.status = "approved";
-  req.reviewedBy = user.username || "HOD";
+  req.reviewedBy = Auth.actorLabel("HOD");
   req.reviewedAt = new Date().toISOString();
   // The correction and the request's new status are saved together, or neither is
   const both = db.batch();
@@ -6562,13 +6659,13 @@ const req = doc.data();
   decision: "Rejected",
   reason: req.reason,
   requestedBy: req.requestedBy,
-  approvedBy: user.username || "HOD",
+  approvedBy: Auth.actorLabel("HOD"),
   departmentId: req.departmentId || App.dept(),
   timestamp: new Date().toISOString()
 };
   // Mark request as rejected, together with the register entry
   req.status = "rejected";
-  req.reviewedBy = user.username || "HOD";
+  req.reviewedBy = Auth.actorLabel("HOD");
   req.reviewedAt = new Date().toISOString();
   const both = db.batch();
   both.set(db.collection("attendanceCorrections").doc(String(correctionId)), correction);

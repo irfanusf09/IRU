@@ -29,6 +29,14 @@ Admin (0–180), and never past midnight. The first-saved marks are kept; change
 are marked **†** in registers. After that, corrections go to the HOD as before. Google's
 servers check the time, so a phone's clock can't extend it.
 
+**When an HOD or the Principal changes:** each department has one active HOD and the
+institution one active Principal. The Institution Admin uses **Hand over** on that person's
+row (Institution Setup → HOD & Principal logins): the successor gets the **same login ID**
+with a new password, and the former holder's account is kept, deactivated, under an
+archive ID (e.g. `hod.phy.until-2026-10-24`) and listed under **Show former**. What they did
+stays under their name: records now say who acted by name and login ID, e.g.
+"Dr Rafiq (hod.phy)". Former teachers are likewise listed only under **Show former teachers**.
+
 A department can teach students of other departments (e.g. a Minor): its HOD uploads the
 roll numbers, the students are found in their home department, and the offering HOD sees
 their attendance in that subject. Roll numbers are unique in the institution; a student's
